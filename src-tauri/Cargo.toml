@@ -1,0 +1,32 @@
+[package]
+name = "kontrolrgb"
+version = "0.1.0"
+description = "Custom RGB controller for local hardware"
+authors = ["jawad"]
+edition = "2021"
+default-run = "kontrolrgb"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "kontrolrgb_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["time"] }
+parking_lot = "0.12"
+thiserror = "2"
+hidapi = "2"           # M2: GMMK v1 keyboard, M3: MSI Mystic Light
+
+# M4: Gigabyte GPU uses hand-rolled NvAPI FFI, no crate
+
