@@ -1,3 +1,4 @@
+import { useRef, useState } from "react";
 import { useDevices } from "../../store/devices";
 import type { ZoneInfo } from "../../types/device";
 import { cssColor } from "../../types/device";
@@ -11,6 +12,13 @@ export function LedStrip({ deviceId, zone }: Props) {
   const colors = useDevices((s) => s.frames[deviceId]?.[zone.id]);
   const paintLed = useDevices((s) => s.paintLed);
   const resizeZone = useDevices((s) => s.resizeZone);
+  const renameZone = useDevices((s) => s.renameZone);
+  const identifyZone = useDevices((s) => s.identifyZone);
+
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(zone.name);
+  // Set when Escape cancels, so the trailing blur doesn't commit the edit.
+  const cancelled = useRef(false);
 
   const step = (delta: number) => {
     const next = Math.min(
@@ -20,11 +28,57 @@ export function LedStrip({ deviceId, zone }: Props) {
     if (next !== zone.led_count) resizeZone(deviceId, zone.id, next);
   };
 
+  const startEdit = () => {
+    setDraft(zone.name);
+    cancelled.current = false;
+    setEditing(true);
+  };
+
+  const commit = () => {
+    setEditing(false);
+    if (cancelled.current) return;
+    const name = draft.trim();
+    if (name !== zone.name) renameZone(deviceId, zone.id, name);
+  };
+
   return (
     <div className="space-y-2">
       <div className="flex items-center gap-3">
-        <h3 className="text-sm font-semibold text-zinc-300">{zone.name}</h3>
+        {editing ? (
+          <input
+            autoFocus
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onBlur={commit}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commit();
+              if (e.key === "Escape") {
+                cancelled.current = true;
+                setEditing(false);
+              }
+            }}
+            className="w-44 rounded bg-panel-2 px-2 py-0.5 text-sm font-semibold text-zinc-100 outline-none ring-1 ring-zinc-600 focus:ring-violet-500"
+          />
+        ) : (
+          <button
+            onClick={startEdit}
+            title="Rename header"
+            className="group flex items-center gap-1 text-sm font-semibold text-zinc-300 hover:text-zinc-100"
+          >
+            {zone.name}
+            <span className="text-xs text-zinc-600 opacity-0 transition-opacity group-hover:opacity-100">
+              ✎
+            </span>
+          </button>
+        )}
         <span className="text-xs text-zinc-500">{zone.led_count} LEDs</span>
+        <button
+          onClick={() => identifyZone(deviceId, zone.id)}
+          className="rounded bg-panel-2 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-700"
+          title="Pulse this strip to identify which header it is"
+        >
+          ◉ Pulse
+        </button>
         {zone.resizable && (
           <div className="flex items-center gap-1">
             <button

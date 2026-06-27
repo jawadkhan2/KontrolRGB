@@ -35,12 +35,32 @@ export interface DeviceInfo {
   supported_effects: string[];
 }
 
+/** Firmware-animated effect modes (the device MCU runs these itself). */
+export type OnboardMode =
+  | "fixed"
+  | "breathing"
+  | "wave"
+  | "spectrum"
+  | "reactive"
+  | "swirl";
+
+export interface OnboardEffect {
+  mode: OnboardMode;
+  color: Color;
+  rainbow: boolean;
+  /** 0..=4 */
+  speed: number;
+  reverse: boolean;
+}
+
 export type EffectConfig =
   | { kind: "static"; color: Color }
   | { kind: "breathing"; color: Color; speed: number }
   | { kind: "rainbow_wave"; speed: number; reverse: boolean }
   | { kind: "color_cycle"; speed: number }
-  | { kind: "custom" };
+  | { kind: "custom" }
+  // Serde flattens the OnboardEffect fields alongside the tag.
+  | ({ kind: "onboard" } & OnboardEffect);
 
 export type EffectKind = EffectConfig["kind"];
 

@@ -84,18 +84,58 @@ pub struct DeviceInfo {
     pub supported_effects: Vec<String>,
 }
 
+/// A firmware-driven ("onboard") effect: the device MCU animates it itself.
+/// Used for devices (e.g. the GMMK v1) whose host write throughput is too low
+/// to stream smooth animation — we set the mode once and the hardware runs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnboardMode {
+    Fixed,
+    Breathing,
+    Wave,
+    Spectrum,
+    Reactive,
+    Swirl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OnboardEffect {
+    pub mode: OnboardMode,
+    /// Base color for single-color modes (ignored when `rainbow`).
+    pub color: Color,
+    /// Let the firmware cycle hue instead of using `color`.
+    pub rainbow: bool,
+    /// 0..=4 (0 slowest).
+    pub speed: u8,
+    /// Reverse animation direction where the mode supports it.
+    pub reverse: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EffectConfig {
-    Static { color: Color },
-    Breathing { color: Color, speed: f32 },
-    RainbowWave { speed: f32, reverse: bool },
-    ColorCycle { speed: f32 },
+    Static {
+        color: Color,
+    },
+    Breathing {
+        color: Color,
+        speed: f32,
+    },
+    RainbowWave {
+        speed: f32,
+        reverse: bool,
+    },
+    ColorCycle {
+        speed: f32,
+    },
     /// Per-LED colors live in DeviceRuntimeState::custom_colors.
     Custom,
+    /// Firmware-animated effect (hardware runs it; host sets it once).
+    Onboard(OnboardEffect),
 }
 
 impl EffectConfig {
+    /// Host-computed effect kinds (used by the mock devices' supported_effects).
     pub const ALL_KINDS: [&'static str; 5] = [
         "static",
         "breathing",

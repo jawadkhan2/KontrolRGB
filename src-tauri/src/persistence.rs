@@ -10,11 +10,14 @@ use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
 use crate::device::types::DeviceId;
+use crate::fan::FanConfig;
 use crate::state::{AppState, DeviceRuntimeState};
 
 #[derive(Serialize, Deserialize)]
 struct ConfigFile {
     version: u32,
+    #[serde(default)]
+    fan: FanConfig,
     devices: HashMap<DeviceId, DeviceConfig>,
 }
 
@@ -24,10 +27,16 @@ struct DeviceConfig {
     runtime: DeviceRuntimeState,
     #[serde(default)]
     zone_led_counts: HashMap<String, u32>,
+    /// User-renamed zones: zone_id -> custom name.
+    #[serde(default)]
+    zone_names: HashMap<String, String>,
 }
 
 fn config_path(app: &tauri::AppHandle) -> Option<PathBuf> {
-    app.path().app_data_dir().ok().map(|d| d.join("config.json"))
+    app.path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("config.json"))
 }
 
 /// Load config and apply it: resize zones, seed runtime states. Call from
@@ -35,20 +44,30 @@ fn config_path(app: &tauri::AppHandle) -> Option<PathBuf> {
 pub fn load_and_apply(app: &tauri::AppHandle, state: &AppState) {
     state.seed_runtime();
     let Some(path) = config_path(app) else { return };
-    let Ok(raw) = std::fs::read_to_string(&path) else { return };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
     let Ok(config) = serde_json::from_str::<ConfigFile>(&raw) else {
         eprintln!("config.json unreadable, using defaults");
         return;
     };
 
+    state.fan.apply_config(config.fan);
+
     let mut manager = state.manager.lock();
     let mut runtime = state.runtime.lock();
+    let mut zone_names = state.zone_names.lock();
     for (id, dev_config) in config.devices {
-        let Some(device) = manager.get_mut(&id) else { continue };
+        let Some(device) = manager.get_mut(&id) else {
+            continue;
+        };
         for (zone_id, count) in &dev_config.zone_led_counts {
             if let Err(e) = device.resize_zone(zone_id, *count) {
                 eprintln!("restore resize {id}/{zone_id}: {e}");
             }
+        }
+        if !dev_config.zone_names.is_empty() {
+            zone_names.insert(id.clone(), dev_config.zone_names);
         }
         runtime.insert(id, dev_config.runtime);
     }
@@ -71,6 +90,7 @@ fn snapshot(state: &AppState) -> ConfigFile {
         })
         .collect();
 
+    let zone_names = state.zone_names.lock();
     let devices = state
         .runtime
         .lock()
@@ -81,25 +101,57 @@ fn snapshot(state: &AppState) -> ConfigFile {
                 DeviceConfig {
                     runtime: rt.clone(),
                     zone_led_counts: zone_counts.get(id).cloned().unwrap_or_default(),
+                    zone_names: zone_names.get(id).cloned().unwrap_or_default(),
                 },
             )
         })
         .collect();
 
-    ConfigFile { version: 1, devices }
+    ConfigFile {
+        version: 1,
+        fan: state.fan.config(),
+        devices,
+    }
 }
 
-fn save(app: &tauri::AppHandle, state: &AppState) {
-    let Some(path) = config_path(app) else { return };
+fn replace_file(tmp: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return std::fs::rename(tmp, path);
+    }
+
+    let backup = path.with_extension("json.bak");
+    let _ = std::fs::remove_file(&backup);
+    std::fs::rename(path, &backup)?;
+    match std::fs::rename(tmp, path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&backup);
+            Ok(())
+        }
+        Err(err) => {
+            let _ = std::fs::rename(&backup, path);
+            Err(err)
+        }
+    }
+}
+
+fn save(app: &tauri::AppHandle, state: &AppState) -> Result<(), String> {
+    let path = config_path(app).ok_or_else(|| "config path unavailable".to_string())?;
     let config = snapshot(state);
-    let Ok(json) = serde_json::to_string_pretty(&config) else { return };
+    let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, json).is_ok() {
-        if let Err(e) = std::fs::rename(&tmp, &path) {
+    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+    replace_file(&tmp, &path).map_err(|e| e.to_string())
+}
+
+pub fn save_now(app: &tauri::AppHandle, state: &AppState) {
+    match save(app, state) {
+        Ok(()) => state.dirty.store(false, Ordering::Relaxed),
+        Err(e) => {
             eprintln!("config save failed: {e}");
+            state.dirty.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -110,7 +162,10 @@ pub async fn run_saver(app: tauri::AppHandle, state: Arc<AppState>) {
     loop {
         interval.tick().await;
         if state.dirty.swap(false, Ordering::Relaxed) {
-            save(&app, &state);
+            if let Err(e) = save(&app, &state) {
+                eprintln!("config save failed: {e}");
+                state.dirty.store(true, Ordering::Relaxed);
+            }
         }
     }
 }

@@ -27,7 +27,29 @@ export const setLedColor = (
 export const resizeZone = (deviceId: string, zoneId: string, ledCount: number) =>
   invoke<DeviceInfo[]>("resize_zone", { deviceId, zoneId, ledCount });
 
+export const renameZone = (deviceId: string, zoneId: string, name: string) =>
+  invoke<DeviceInfo[]>("rename_zone", { deviceId, zoneId, name });
+
+export const identifyZone = (deviceId: string, zoneId: string) =>
+  invoke<void>("identify_zone", { deviceId, zoneId });
+
 export const applyToAll = (effect: EffectConfig, brightness?: number) =>
   invoke<void>("apply_to_all", { effect, brightness: brightness ?? null });
 
 export const rescanDevices = () => invoke<DeviceInfo[]>("rescan_devices");
+
+// --- Startup conflict guard -----------------------------------------------
+
+export interface ConflictProcess {
+  pid: number;
+  displayName: string;
+  exeName: string;
+}
+
+export const scanRgbConflicts = () =>
+  invoke<ConflictProcess[]>("scan_rgb_conflicts");
+
+export const killRgbConflicts = (pids: number[]) =>
+  invoke<void>("kill_rgb_conflicts", { pids });
+
+export const quitApp = () => invoke<void>("quit_app");

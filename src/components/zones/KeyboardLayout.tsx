@@ -21,7 +21,6 @@ function Key({
   onPaint: () => void;
 }) {
   const css = color ? cssColor(color) : "#18181b";
-  const bright = color && color.r + color.g + color.b > 120;
   return (
     <button
       onMouseDown={onPaint}
@@ -36,7 +35,9 @@ function Key({
         width: k.w * UNIT - GAP,
         height: k.h * UNIT - GAP,
         background: css,
-        color: bright ? "rgba(0,0,0,0.75)" : "rgba(255,255,255,0.55)",
+        // Always white legends, lifted off the colored key with a dark halo.
+        color: "rgba(255,255,255,0.92)",
+        textShadow: "0 1px 2px rgba(0,0,0,0.85), 0 0 1px rgba(0,0,0,0.9)",
         boxShadow: color ? `0 0 8px ${css}66, inset 0 0 4px rgba(0,0,0,0.3)` : undefined,
       }}
     >

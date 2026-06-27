@@ -26,6 +26,8 @@ interface DevicesStore {
   applyBrightness: (deviceId: string, brightness: number) => void;
   paintLed: (deviceId: string, zoneId: string, ledIndex: number) => void;
   resizeZone: (deviceId: string, zoneId: string, ledCount: number) => void;
+  renameZone: (deviceId: string, zoneId: string, name: string) => void;
+  identifyZone: (deviceId: string, zoneId: string) => void;
   applyToAll: (effect: EffectConfig, brightness?: number) => void;
   rescan: () => void;
 }
@@ -35,6 +37,25 @@ async function fetchStates(devices: DeviceInfo[]) {
     devices.map(async (d) => [d.id, await api.getDeviceState(d.id)] as const),
   );
   return Object.fromEntries(entries) as Record<string, DeviceState>;
+}
+
+const paintFlushTimers = new Map<string, number>();
+const paintFlushColors = new Map<string, Color[]>();
+
+function scheduleZonePaint(deviceId: string, zoneId: string, colors: Color[]) {
+  const key = `${deviceId}\u0000${zoneId}`;
+  paintFlushColors.set(key, colors);
+  const currentTimer = paintFlushTimers.get(key);
+  if (currentTimer !== undefined) {
+    window.clearTimeout(currentTimer);
+  }
+  const timer = window.setTimeout(() => {
+    const latest = paintFlushColors.get(key);
+    paintFlushColors.delete(key);
+    paintFlushTimers.delete(key);
+    if (latest) void api.setZoneColors(deviceId, zoneId, latest);
+  }, 60);
+  paintFlushTimers.set(key, timer);
 }
 
 export const useDevices = create<DevicesStore>((set, get) => ({
@@ -94,12 +115,17 @@ export const useDevices = create<DevicesStore>((set, get) => ({
 
   paintLed: (deviceId, zoneId, ledIndex) => {
     const { paintColor, devices, states } = get();
+    const state = states[deviceId];
+    // Only paint when Custom is already the active effect. Clicking keys must
+    // never silently switch a device into Custom — that loses the live effect
+    // on an accidental click. Pick "Custom" first to start painting.
+    if (state?.effect.kind !== "custom") return;
+
     const zone = devices
       .find((d) => d.id === deviceId)
       ?.zones.find((z) => z.id === zoneId);
     if (!zone) return;
 
-    const state = states[deviceId];
     const colors = [...(state?.customColors[zoneId] ?? [])];
     while (colors.length < zone.led_count) colors.push({ r: 0, g: 0, b: 0 });
     colors[ledIndex] = paintColor;
@@ -114,13 +140,36 @@ export const useDevices = create<DevicesStore>((set, get) => ({
         },
       },
     }));
-    void api.setLedColor(deviceId, zoneId, ledIndex, paintColor);
+    scheduleZonePaint(deviceId, zoneId, colors);
   },
 
   resizeZone: (deviceId, zoneId, ledCount) => {
     void api.resizeZone(deviceId, zoneId, ledCount).then((devices) => {
       set({ devices });
     });
+  },
+
+  renameZone: (deviceId, zoneId, name) => {
+    // Optimistic: update the label immediately, reconcile with the backend.
+    set((s) => ({
+      devices: s.devices.map((d) =>
+        d.id === deviceId
+          ? {
+              ...d,
+              zones: d.zones.map((z) =>
+                z.id === zoneId && name ? { ...z, name } : z,
+              ),
+            }
+          : d,
+      ),
+    }));
+    void api.renameZone(deviceId, zoneId, name).then((devices) => {
+      set({ devices });
+    });
+  },
+
+  identifyZone: (deviceId, zoneId) => {
+    void api.identifyZone(deviceId, zoneId);
   },
 
   applyToAll: (effect, brightness) => {

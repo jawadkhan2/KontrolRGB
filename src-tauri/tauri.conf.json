@@ -10,6 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "withGlobalTauri": false,
     "windows": [
       {
         "title": "KontrolRGB",
@@ -17,11 +18,12 @@
         "height": 800,
         "minWidth": 1000,
         "minHeight": 700,
-        "theme": "Dark"
+        "theme": "Dark",
+        "decorations": false
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost; connect-src ipc: http://ipc.localhost http://localhost:* ws://localhost:*"
     }
   },
   "bundle": {

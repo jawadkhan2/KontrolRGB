@@ -745,10 +745,12 @@ impl Nct6687 {
     /// the floor is discovered. Bounded (stops at the first stall or 5%), under
     /// continuous tach watch, and restores the header to BIOS when finished.
     ///
-    /// `on_progress(pct, rpm, phase)` is called for each measured point (and once
-    /// with phase `"settling"` while a step's RPM is stabilizing) so the UI can
-    /// show live duty/RPM during the ~30s sweep — the subsystem lock is held for
-    /// the whole sweep, so polling can't read it any other way.
+    /// `on_progress(pct, rpm, phase)` is called for each measured point and on
+    /// every poll with phase `"settling"` while a step's RPM is stabilizing, so
+    /// the UI can show live duty/RPM — the subsystem lock is held for the whole
+    /// sweep, so polling can't read it any other way. Each step uses an adaptive
+    /// settle (waits only until the RPM stops changing), so a full sweep is fast
+    /// when the fan reacts quickly and only slows for genuinely sluggish movers.
     pub fn sweep_header(
         &self,
         header: usize,
@@ -759,47 +761,73 @@ impl Nct6687 {
         if header >= FAN_CTL.len() {
             return Err(ChipError::EcUnresponsive(0));
         }
-        // Case fans (esp. larger SYS fans) can take up to ~20s to fully settle on
-        // a new duty — measuring sooner reads a mid-ramp RPM and, on the way down,
-        // misreports a still-spinning-down fan as a stall. So we give each step a
-        // long settle. This makes a full sweep take a few minutes per fan; the UI
-        // warns the user up front and offers a Stop button.
-        const SETTLE: Duration = Duration::from_secs(20);
-        const TOP_SETTLE: Duration = Duration::from_secs(20);
         const STEP_PCT: i32 = 5;
         const FLOOR_PCT: i32 = 5;
 
+        // Adaptive settle: instead of waiting a fixed window per step, poll the
+        // tach and move on the moment the RPM stops changing. A fan at high duty
+        // settles in well under a second; only the slow spin-down near the floor
+        // needs the full budget. Result is a much faster sweep *and* a reading
+        // taken at true steady-state rather than mid-ramp.
+        const POLL: Duration = Duration::from_millis(250);
+        // Floor must be long enough that the fan has actually started reacting —
+        // otherwise the first samples still read the PREVIOUS duty's RPM, look
+        // "stable", and the step breaks before the fan moved at all.
+        const MIN_SETTLE: Duration = Duration::from_millis(3500); // every step gets real response time
+        const MAX_SETTLE: Duration = Duration::from_secs(6); // safety cap for a stubborn slow mover
+        // The first step (idle -> full) is the biggest jump and the slowest ramp,
+        // so it gets a longer floor and cap to reach true max before we measure.
+        const TOP_MIN_SETTLE: Duration = Duration::from_secs(8);
+        const TOP_MAX_SETTLE: Duration = Duration::from_secs(15);
+        const STABLE_N: usize = 4; // consecutive samples (~1s) that must agree
+        const STABLE_FLOOR_RPM: u16 = 30; // absolute stability band ...
+        const STABLE_PCT: u16 = 2; // ... or this % of the reading, whichever is larger
+
         let pct_to_duty = |pct: i32| ((pct.clamp(0, 100) as u16 * 255) / 100) as u8;
 
-        // Sleep in short slices so a Stop request is honoured within ~200ms even
-        // mid-settle. On cancel, hand the header back to the BIOS and bail. We
-        // also read the tach about once a second and emit it as a "settling"
-        // sample so the UI shows the fan actually ramping (the subsystem lock is
-        // held for the whole sweep, so this is the only place a live RPM exists).
-        let settle = |dur: Duration, pct: u8| -> Result<(), ChipError> {
-            let deadline = Instant::now() + dur;
-            let mut next_emit = Instant::now();
-            while Instant::now() < deadline {
+        // Drive `pct`, then poll until the RPM holds steady (or MAX_SETTLE), and
+        // return the settled reading. Polls in POLL slices so a Stop lands within
+        // ~250ms even mid-settle; on cancel, hand the header back to the BIOS and
+        // bail. Each poll is emitted as a "settling" sample so the UI shows the
+        // fan ramping (the subsystem lock is held for the whole sweep, so this is
+        // the only place a live RPM exists).
+        let settle_read = |pct: u8, min_settle: Duration, max_settle: Duration| -> Result<u16, ChipError> {
+            let start = Instant::now();
+            let mut recent: Vec<u16> = Vec::with_capacity(STABLE_N);
+            let mut last = 0u16;
+            loop {
                 if cancel.load(Ordering::Relaxed) {
                     let _ = self.release_header(header);
                     return Err(ChipError::SweepCancelled);
                 }
-                if Instant::now() >= next_emit {
-                    if let Ok(rpm) = self.read_rpm(rpm_channel) {
-                        on_progress(pct, rpm, "settling");
+                if let Ok(rpm) = self.read_rpm(rpm_channel) {
+                    last = rpm;
+                    on_progress(pct, rpm, "settling");
+                    if recent.len() == STABLE_N {
+                        recent.remove(0);
                     }
-                    next_emit = Instant::now() + Duration::from_millis(1000);
+                    recent.push(rpm);
                 }
-                sleep(Duration::from_millis(200));
+                let elapsed = start.elapsed();
+                if elapsed >= max_settle {
+                    return Ok(last);
+                }
+                if elapsed >= min_settle && recent.len() == STABLE_N {
+                    let lo = *recent.iter().min().unwrap();
+                    let hi = *recent.iter().max().unwrap();
+                    let band = STABLE_FLOOR_RPM.max(hi.saturating_mul(STABLE_PCT) / 100);
+                    if hi - lo <= band {
+                        return Ok(last);
+                    }
+                }
+                sleep(POLL);
             }
-            Ok(())
         };
 
         // Top end: full duty.
         on_progress(100, 0, "settling");
         self.set_manual_pwm(header, 255)?;
-        settle(TOP_SETTLE, 100)?;
-        let max_rpm = self.read_rpm(rpm_channel)?;
+        let max_rpm = settle_read(100, TOP_MIN_SETTLE, TOP_MAX_SETTLE)?;
         on_progress(100, max_rpm, "measuring");
 
         let mut samples = vec![(100u8, max_rpm)];
@@ -812,14 +840,20 @@ impl Nct6687 {
         while pct >= FLOOR_PCT {
             on_progress(pct as u8, 0, "settling");
             self.set_manual_pwm(header, pct_to_duty(pct))?;
-            settle(SETTLE, pct as u8)?;
-            let rpm = self.read_rpm(rpm_channel)?;
+            let mut rpm = settle_read(pct as u8, MIN_SETTLE, MAX_SETTLE)?;
+            // A reading of 0 can be a transient mid-coast sample rather than a real
+            // stall, so re-settle once and confirm before declaring the floor.
+            if rpm == 0 {
+                rpm = settle_read(pct as u8, MIN_SETTLE, MAX_SETTLE)?;
+                if rpm == 0 {
+                    on_progress(pct as u8, 0, "measuring");
+                    samples.push((pct as u8, 0));
+                    stall_pct = Some(pct as u8);
+                    break;
+                }
+            }
             on_progress(pct as u8, rpm, "measuring");
             samples.push((pct as u8, rpm));
-            if rpm == 0 {
-                stall_pct = Some(pct as u8);
-                break;
-            }
             min_running_pct = pct as u8;
             min_running_rpm = rpm;
             pct -= STEP_PCT;

@@ -123,6 +123,7 @@ pub fn mock_msi_z890() -> MockDevice {
             fixed_zone("onboard", "Onboard LEDs", 8),
             argb_header("jargb_v2_1", "JARGB_V2 1", 30),
             argb_header("jargb_v2_2", "JARGB_V2 2", 30),
+            argb_header("jargb_v2_3", "JARGB_V2 3", 30),
         ],
         supported_effects: EffectConfig::ALL_KINDS.map(String::from).to_vec(),
     })

@@ -19,7 +19,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -27,6 +27,22 @@ tokio = { version = "1", features = ["time"] }
 parking_lot = "0.12"
 thiserror = "2"
 hidapi = "2"           # M2: GMMK v1 keyboard, M3: MSI Mystic Light
+sysinfo = "0.32"      # process enumeration for startup conflict guard
 
 # M4: Gigabyte GPU uses hand-rolled NvAPI FFI, no crate
+
+[target.'cfg(windows)'.dependencies]
+# Dynamically load WinRing0x64.dll for ring-0 LPC/EC port I/O (fan control on
+# the NCT6687D-R). Loaded at runtime so the app still starts without the driver.
+libloading = "0.8"
+# Raw Win32 for overlapped (async) HID writes — experiment to beat hidapi's
+# ~22ms/write synchronous ceiling. Only used by the ovlbench probe binary.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_Devices_HumanInterfaceDevice",
+] }
 

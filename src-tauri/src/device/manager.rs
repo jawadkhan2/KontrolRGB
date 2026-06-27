@@ -1,5 +1,5 @@
 use super::types::{DeviceId, DeviceInfo};
-use super::{gmmk, mock, RgbDevice};
+use super::{gmmk, mock, msi, RgbDevice};
 
 pub struct DeviceManager {
     devices: Vec<Box<dyn RgbDevice>>,
@@ -7,7 +7,9 @@ pub struct DeviceManager {
 
 impl DeviceManager {
     pub fn new() -> Self {
-        let mut m = DeviceManager { devices: Vec::new() };
+        let mut m = DeviceManager {
+            devices: Vec::new(),
+        };
         m.rescan();
         m
     }
@@ -31,7 +33,18 @@ impl DeviceManager {
             }
         }
 
-        self.devices.push(Box::new(mock::mock_msi_z890())); // M3
+        match msi::probe() {
+            Ok(Some(dev)) => self.devices.push(Box::new(dev)),
+            Ok(None) => {
+                eprintln!("msi: board not found, using mock");
+                self.devices.push(Box::new(mock::mock_msi_z890()));
+            }
+            Err(e) => {
+                eprintln!("msi: probe failed ({e}), using mock");
+                self.devices.push(Box::new(mock::mock_msi_z890()));
+            }
+        }
+
         self.devices.push(Box::new(mock::mock_rtx5080())); // M4
     }
 
