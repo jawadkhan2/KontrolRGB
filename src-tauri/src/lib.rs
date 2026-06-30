@@ -1,7 +1,9 @@
+mod admin;
 mod commands;
 mod device;
 mod effects;
 mod fan;
+mod gpu_telemetry;
 mod persistence;
 mod process_guard;
 mod state;
@@ -22,6 +24,8 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(app_state.clone())
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -66,9 +70,13 @@ pub fn run() {
             commands::fan_cancel_sweep,
             commands::fan_ec_capture,
             commands::fan_heartbeat,
+            commands::fan_set_control_plan,
+            commands::gpu_telemetry,
             commands::scan_rgb_conflicts,
             commands::kill_rgb_conflicts,
             commands::quit_app,
+            commands::is_elevated,
+            commands::relaunch_as_admin,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

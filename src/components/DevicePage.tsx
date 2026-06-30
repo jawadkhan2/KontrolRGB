@@ -8,6 +8,7 @@ import { ZoneView } from "./zones/ZoneView";
 import { ArgbHeaderStrip } from "./zones/ArgbHeaderStrip";
 import { MotherboardBoard } from "./zones/MotherboardBoard";
 import { GpuRender } from "./zones/GpuRender";
+import { GpuTelemetryBar } from "./GpuTelemetryBar";
 
 const TYPE_ICONS: Record<DeviceType, ReactNode> = {
   keyboard: (
@@ -52,14 +53,6 @@ const PRESETS: Color[] = [
   { r: 251, g: 191, b: 36 },  // amber
   { r: 132, g: 204, b: 22 },  // green
   { r: 255, g: 255, b: 255 }, // white
-];
-
-/** GPU telemetry tiles (values pending the RTX driver backend). */
-const GPU_TELEM = [
-  { label: "GPU Temp", unit: "°C" },
-  { label: "Core Clock", unit: "MHz" },
-  { label: "Fan Speed", unit: "%" },
-  { label: "Power", unit: "W" },
 ];
 
 const hex2 = (n: number) => n.toString(16).padStart(2, "0");
@@ -160,25 +153,10 @@ export function DevicePage() {
             </div>
           </div>
 
-          {/* telemetry — populated once the RTX driver backend lands */}
-          <div className="card" style={{ marginBottom: 16 }}>
-            <div className="card-pad">
-              <div className="gpu-telem">
-                {GPU_TELEM.map((t) => (
-                  <div key={t.label}>
-                    <div className="muted">{t.label}</div>
-                    <div className="gv">—<small> {t.unit}</small></div>
-                    <div className="gbar"><span style={{ width: 0 }} /></div>
-                  </div>
-                ))}
-              </div>
-              <p className="muted" style={{ margin: "12px 0 0" }}>
-                Live telemetry (temp · clock · fan · power) arrives with the RTX driver backend.
-              </p>
-            </div>
-          </div>
+          {/* live GPU telemetry over NVML (temp · clock · fan · power) */}
+          <GpuTelemetryBar />
 
-          <div className="grid-2">
+          <div className="grid-2 gpu-grid">
             <GpuRender deviceId={device.id} device={device} />
             <div className="stack">
               {effectCard}
@@ -223,16 +201,6 @@ export function DevicePage() {
             {device.zones.map((zone) => (
               <ZoneView key={zone.id} deviceId={device.id} zone={zone} />
             ))}
-            <div className="stage-legend">
-              <div className="item">
-                <span className="sw" style={{ background: "var(--seg)" }} />
-                {state ? EFFECT_LABELS[state.effect.kind] : "—"} · live preview
-              </div>
-              <div className="item">
-                <span className="sw" style={{ background: "linear-gradient(90deg,#ff5a4d,#fbbf24,#84cc16,#22d3ee,#5b8cff)" }} />
-                Switch to Custom to paint individual {isKeyboard ? "keys" : "LEDs"}
-              </div>
-            </div>
           </div>
         )}
 

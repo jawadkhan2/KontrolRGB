@@ -5,6 +5,8 @@ import { useSettings } from "./settings";
 import type {
   BurstProgress,
   ChannelReading,
+  ControlMode,
+  FanControlPlan,
   FanStatus,
   SweepProgress,
   SweepResult,
@@ -13,7 +15,7 @@ import type {
 
 // --- Types ---
 
-export type TempSourceKey = "cpu" | "aux0" | "aux1" | "aux2" | "aux3";
+export type TempSourceKey = "cpu" | "aux0" | "aux1" | "aux2" | "aux3" | "gpu";
 
 export interface CurvePoint {
   tempC: number;
@@ -110,6 +112,8 @@ interface PersistedState {
   customProfiles: FanProfile[];
   fanModes: Record<number, FanMode>;
   activeProfileId: string;
+  /** User-renamed fans, keyed by tach channel. */
+  fanNames: Record<number, string>;
 }
 
 function loadSaved(): Partial<PersistedState> {
@@ -136,6 +140,14 @@ interface FansStore {
   temps: TempReading[];
   loaded: boolean;
   stopping: boolean;
+  /**
+   * True while fans should be left on the BIOS curve — either the user pressed
+   * STOP → BIOS, or "control on startup" is off and they haven't engaged yet.
+   * Pushed to the backend control loop (which then asserts nothing). Cleared
+   * (re-engaging control) only by an explicit user action: changing a fan's
+   * speed or mode. Never set on navigation, mount, or unmount.
+   */
+  released: boolean;
   mappingChannel: number | null;
   sweepingChannel: number | null;
   sweepResults: Record<number, SweepResult>;
@@ -154,10 +166,14 @@ interface FansStore {
   profiles: FanProfile[];
   activeProfileId: string;
   fanModes: Record<number, FanMode>;
+  /** User-renamed fans, keyed by tach channel. Falls back to the header label. */
+  fanNames: Record<number, string>;
   lastCommandedPct: Record<number, number>;
 
   // Actions — hardware
   refresh: () => Promise<void>;
+  /** Rebuild and push the background control plan to the backend control loop. */
+  pushControlPlan: () => void;
   stop: () => Promise<void>;
   confirmChannel: (index: number) => Promise<void>;
   mapHeader: (rpmChannel: number) => Promise<void>;
@@ -168,6 +184,9 @@ interface FansStore {
 
   // Actions — profiles
   setActiveProfile: (id: string) => void;
+  /** Set the active profile AND drive every mapped fan onto it (curve mode). */
+  applyProfileToAll: (id: string) => void;
+  renameFan: (rpmChannel: number, name: string) => void;
   setFanMode: (rpmChannel: number, mode: FanMode) => void;
   updateProfilePoints: (profileId: string, points: CurvePoint[]) => void;
   setProfileSource: (profileId: string, source: TempSourceKey) => void;
@@ -183,7 +202,42 @@ function persist(store: FansStore) {
     customProfiles: store.profiles.filter((p) => !p.isBuiltin),
     fanModes: store.fanModes,
     activeProfileId: store.activeProfileId,
+    fanNames: store.fanNames,
   });
+}
+
+/**
+ * Translate the store's profile/mode state into the backend control plan. The
+ * backend control loop owns this from the moment it's pushed and applies it to
+ * whatever fans it has mapped — so the plan depends only on config (modes,
+ * profiles, released), never on the live mapping list.
+ */
+function buildControlPlan(store: FansStore): FanControlPlan {
+  const resolve = (mode: FanMode): ControlMode => {
+    if (mode.type === "manual") return { type: "manual", pct: mode.pct };
+    const profile =
+      store.profiles.find((p) => p.id === mode.profileId) ??
+      store.profiles.find((p) => p.id === "balanced") ??
+      BUILTIN_PROFILES[1];
+    return {
+      type: "curve",
+      tempSource: profile.tempSource,
+      points: profile.points.map((p) => ({ tempC: p.tempC, speedPct: p.speedPct })),
+    };
+  };
+
+  const modes: Record<number, ControlMode> = {};
+  for (const [ch, mode] of Object.entries(store.fanModes)) {
+    modes[Number(ch)] = resolve(mode);
+  }
+
+  return {
+    released: store.released,
+    // Mapped-but-unassigned fans (e.g. just burst-detected) follow Balanced,
+    // matching the historical per-fan default.
+    defaultMode: resolve({ type: "curve", profileId: "balanced" }),
+    modes,
+  };
 }
 
 export const useFans = create<FansStore>((set, get) => ({
@@ -193,6 +247,9 @@ export const useFans = create<FansStore>((set, get) => ({
   temps: [],
   loaded: false,
   stopping: false,
+  // Start released unless the user opted into engaging control on startup; the
+  // startup flow (and any explicit fan action) clears it to engage.
+  released: !useSettings.getState().fanControlOnStartup,
   mappingChannel: null,
   sweepingChannel: null,
   sweepResults: {},
@@ -207,69 +264,57 @@ export const useFans = create<FansStore>((set, get) => ({
   profiles: [...BUILTIN_PROFILES, ...(saved.customProfiles ?? [])],
   activeProfileId: saved.activeProfileId ?? "balanced",
   fanModes: saved.fanModes ?? {},
+  fanNames: saved.fanNames ?? {},
   lastCommandedPct: {},
 
   refresh: async () => {
-    // While a sweep runs, the backend holds the chip lock for minutes; every
-    // fanStatus/fanRead would block a worker until it releases. Skip the polled
-    // hardware reads — the calibration modal updates from `fan-sweep-progress`
-    // events instead — so we don't pile up hundreds of blocked calls.
+    // Display-only now: fetch live status/RPM/temps for whatever page is open.
+    // Actual fan *control* runs in the backend control loop (immune to webview
+    // timer throttling); this no longer asserts duties or feeds the watchdog.
+    //
+    // While a sweep or burst runs, the backend holds the chip lock; reading
+    // through it would block a worker and pile up polls. The calibration/burst
+    // modals update from their own progress events, so skip the polled read.
     if (get().sweepingChannel !== null) return;
+    if (get().burstDetecting) return;
 
-    let status: FanStatus;
-    let readings: ChannelReading[] = [];
-    let temps: TempReading[] = [];
     try {
       const snapshot = await fanApi.fanSnapshot();
-      status = snapshot.status;
-      readings = snapshot.readings;
-      temps = snapshot.temps;
+      set({
+        status: snapshot.status,
+        readings: snapshot.readings,
+        temps: snapshot.temps,
+        loaded: true,
+      });
     } catch {
-      const current = get();
-      status =
-        current.status ?? {
-          available: false,
-          detail: "fan control unavailable",
-          chip: null,
-          confirmedRpmChannels: [],
-          writesEnabled: false,
-          manualActive: false,
-          mappings: [],
-        };
-      readings = current.readings;
-      temps = current.temps;
-    }
-
-    if (status.manualActive) {
-      void fanApi.fanHeartbeat().catch(() => {});
-    }
-
-    // Auto-apply curve control for each mapped fan
-    const { profiles, fanModes, lastCommandedPct } = get();
-    const newLastCommanded = { ...lastCommandedPct };
-
-    for (const mapping of status.mappings) {
-      const mode = fanModes[mapping.rpmChannel] ?? { type: "curve", profileId: "balanced" };
-      if (mode.type !== "curve") continue;
-      const profile = profiles.find((p) => p.id === mode.profileId);
-      if (!profile) continue;
-      const tempReading = temps.find((t) => t.key === profile.tempSource);
-      if (!tempReading) continue;
-
-      const rawTarget = interpolateCurve(profile.points, tempReading.tempC);
-      const clamped = Math.max(mapping.minPwm, Math.min(mapping.maxPwm, rawTarget));
-      const last = lastCommandedPct[mapping.rpmChannel] ?? -99;
-      if (Math.abs(clamped - last) > 2) {
-        newLastCommanded[mapping.rpmChannel] = clamped;
-        void fanApi.fanSetSpeed(mapping.rpmChannel, clamped).catch(() => {});
+      // Keep the last good readings; just synthesize an unavailable status if we
+      // never got one, so the UI can leave its loading state.
+      if (!get().status) {
+        set({
+          status: {
+            available: false,
+            detail: "fan control unavailable",
+            chip: null,
+            confirmedRpmChannels: [],
+            writesEnabled: false,
+            manualActive: false,
+            mappings: [],
+          },
+        });
       }
+      set({ loaded: true });
     }
+  },
 
-    set({ status, readings, temps, loaded: true, lastCommandedPct: newLastCommanded });
+  pushControlPlan: () => {
+    void fanApi.fanSetControlPlan(buildControlPlan(get())).catch(() => {});
   },
 
   stop: async () => {
-    set({ stopping: true, lastCommandedPct: {} });
+    // Mark released and push it to the backend loop BEFORE the stop, so the loop
+    // can't re-assert control between the release and the state settling.
+    set({ stopping: true, released: true, lastCommandedPct: {} });
+    get().pushControlPlan();
     try {
       await fanApi.fanStop();
       await get().refresh();
@@ -293,6 +338,7 @@ export const useFans = create<FansStore>((set, get) => ({
       };
       set({ fanModes });
       persist(get());
+      get().pushControlPlan();
       await get().refresh();
     } finally {
       set({ mappingChannel: null });
@@ -300,10 +346,14 @@ export const useFans = create<FansStore>((set, get) => ({
   },
 
   setSpeed: async (rpmChannel, pct) => {
-    await fanApi.fanSetSpeed(rpmChannel, pct);
+    // An explicit speed change re-engages control after a STOP → BIOS. Write the
+    // duty now for instant feedback; the backend loop holds it from here.
     set((s) => ({
+      released: false,
       lastCommandedPct: { ...s.lastCommandedPct, [rpmChannel]: pct },
     }));
+    await fanApi.fanSetSpeed(rpmChannel, pct).catch(() => {});
+    get().pushControlPlan();
     await get().refresh();
   },
 
@@ -338,7 +388,17 @@ export const useFans = create<FansStore>((set, get) => ({
     set({ burstDetecting: true, burstProgress: null });
     try {
       await fanApi.fanBurstDetect(useSettings.getState().burstSeconds);
-      set({ burstDone: true });
+      // Burst ends with every header handed back to the BIOS. Engage control
+      // (unless the user opted out of control-on-startup, and hasn't already
+      // engaged) and push the plan so the backend loop pulls each freshly
+      // detected fan into its saved profile and holds it there.
+      const engage = useSettings.getState().fanControlOnStartup;
+      set((s) => ({
+        burstDone: true,
+        released: s.released && !engage,
+        lastCommandedPct: {},
+      }));
+      get().pushControlPlan();
       await get().refresh();
     } catch (e) {
       const msg = String(e);
@@ -359,42 +419,53 @@ export const useFans = create<FansStore>((set, get) => ({
     persist(get());
   },
 
+  applyProfileToAll: (id) => {
+    set((s) => {
+      const modes: Record<number, FanMode> = { ...s.fanModes };
+      for (const m of s.status?.mappings ?? []) {
+        modes[m.rpmChannel] = { type: "curve", profileId: id };
+      }
+      // Picking a global profile re-engages control after a STOP → BIOS.
+      return { activeProfileId: id, fanModes: modes, released: false };
+    });
+    persist(get());
+    get().pushControlPlan();
+  },
+
+  renameFan: (rpmChannel, name) => {
+    set((s) => {
+      const fanNames = { ...s.fanNames };
+      const trimmed = name.trim();
+      if (trimmed) fanNames[rpmChannel] = trimmed;
+      else delete fanNames[rpmChannel];
+      return { fanNames };
+    });
+    persist(get());
+  },
+
   setFanMode: (rpmChannel, mode) => {
     const fanModes = { ...get().fanModes, [rpmChannel]: mode };
-    const lastCommandedPct = { ...get().lastCommandedPct, [rpmChannel]: -99 };
-    set({ fanModes, lastCommandedPct });
+    // Picking a mode re-engages control after a STOP → BIOS.
+    set({ fanModes, released: false });
     persist(get());
+    get().pushControlPlan();
   },
 
   updateProfilePoints: (profileId, points) => {
     set((s) => ({
       profiles: s.profiles.map((p) => (p.id === profileId ? { ...p, points } : p)),
     }));
-    // Force re-apply on next refresh
-    set((s) => ({
-      lastCommandedPct: Object.fromEntries(
-        Object.entries(s.lastCommandedPct).map(([k, v]) => {
-          const mode = s.fanModes[Number(k)];
-          return mode?.type === "curve" && mode.profileId === profileId ? [k, -99] : [k, v];
-        }),
-      ),
-    }));
     persist(get());
+    // Push the edited curve so the backend loop re-evaluates affected fans.
+    get().pushControlPlan();
   },
 
   setProfileSource: (profileId, source) => {
     set((s) => ({
       profiles: s.profiles.map((p) => (p.id === profileId ? { ...p, tempSource: source } : p)),
     }));
-    set((s) => ({
-      lastCommandedPct: Object.fromEntries(
-        Object.entries(s.lastCommandedPct).map(([k, v]) => {
-          const mode = s.fanModes[Number(k)];
-          return mode?.type === "curve" && mode.profileId === profileId ? [k, -99] : [k, v];
-        }),
-      ),
-    }));
     persist(get());
+    get().pushControlPlan();
   },
 
   addProfile: (name, fromProfileId) => {
@@ -430,6 +501,8 @@ export const useFans = create<FansStore>((set, get) => ({
       return { profiles, activeProfileId, fanModes };
     });
     persist(get());
+    // Fans on the deleted profile were reassigned to Balanced — re-push.
+    get().pushControlPlan();
   },
 
   renameProfile: (profileId, name) => {
@@ -439,6 +512,18 @@ export const useFans = create<FansStore>((set, get) => ({
     persist(get());
   },
 }));
+
+/**
+ * True only when every controllable fan is under the app (none left on the BIOS
+ * curve). The pump is excluded — it's intentionally never app-controlled. Drives
+ * the green status dots in the sidebar and fan page: any fan on BIOS → not green.
+ */
+export function fansFullyControlled(s: FansStore): boolean {
+  const st = s.status;
+  if (!st?.available || s.released) return false;
+  if (st.mappings.length === 0) return false;
+  return st.manualActive;
+}
 
 // Stream live sweep progress from the backend into the store.
 void listen<SweepProgress>("fan-sweep-progress", (e) => {

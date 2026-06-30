@@ -45,7 +45,23 @@ impl DeviceManager {
             }
         }
 
-        self.devices.push(Box::new(mock::mock_rtx5080())); // M4
+        self.scan_gpu();
+    }
+
+    /// Probe the Gigabyte GPU (M4). NvAPI is Windows-only, so non-Windows
+    /// builds and machines without the card fall back to the mock.
+    fn scan_gpu(&mut self) {
+        #[cfg(windows)]
+        match super::gigabyte_gpu::probe() {
+            Ok(Some(dev)) => {
+                self.devices.push(Box::new(dev));
+                return;
+            }
+            Ok(None) => eprintln!("gigabyte-gpu: card not found, using mock"),
+            Err(e) => eprintln!("gigabyte-gpu: probe failed ({e}), using mock"),
+        }
+
+        self.devices.push(Box::new(mock::mock_rtx5080()));
     }
 
     pub fn infos(&self) -> Vec<DeviceInfo> {

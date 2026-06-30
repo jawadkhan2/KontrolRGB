@@ -1,0 +1,58 @@
+name: Release
+
+# Build, sign, and publish a Windows installer + updater manifest on every
+# version tag (e.g. `v0.2.0`). tauri-action signs the bundle with the updater
+# private key and uploads `latest.json` to the GitHub release, which the in-app
+# updater reads from releases/latest/download/latest.json.
+on:
+  push:
+    tags:
+      - "v*"
+  # Manual runs for testing; provide the tag to build against.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.2.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build, sign, and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          # Use the pushed tag, or the manual-dispatch input when run by hand.
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: "KontrolRGB ${{ github.event.inputs.tag || github.ref_name }}"
+          releaseBody: "See the assets to download and install. Existing installs update over the air."
+          # Must be published (not a draft) so releases/latest/download resolves
+          # to it for the in-app updater.
+          releaseDraft: false
+          prerelease: false

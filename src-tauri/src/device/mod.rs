@@ -1,3 +1,5 @@
+#[cfg(windows)]
+pub mod gigabyte_gpu;
 pub mod gmmk;
 pub mod layouts;
 pub mod manager;

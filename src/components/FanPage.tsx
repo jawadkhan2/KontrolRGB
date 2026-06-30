@@ -1,9 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useFans, interpolateCurve } from "../store/fans";
 import type { CurvePoint, FanProfile, TempSourceKey, FanMode } from "../store/fans";
 import type { ChannelReading, FanMapping, SweepProgress, TempReading } from "../lib/fanApi";
+import { gpuTelemetry } from "../lib/api";
 
-const POLL_MS = 400;
 const ACCENT = "#4cc2f0";
 
 /** Backend label for the pump header — shown read-only, BIOS-controlled. */
@@ -15,6 +15,7 @@ const TEMP_SOURCE_LABELS: Record<string, string> = {
   aux1: "CPU Diode",
   aux2: "Aux 2",
   aux3: "Aux 3",
+  gpu: "GPU",
 };
 
 // ─── Curve editor (linear interpolation, matches the backend) ────────────────
@@ -253,17 +254,19 @@ function Sparkline({ value, max }: { value: number; max: number }) {
 // ─── Gauge ───────────────────────────────────────────────────────────────────
 
 function Gauge({ temp, pct }: { temp: number | null; pct: number }) {
-  const R = 22, C = 2 * Math.PI * R;
+  const R = 27, C = 2 * Math.PI * R;
   const off = C * (1 - Math.max(0, Math.min(100, pct)) / 100);
   return (
     <div className="gauge">
-      <svg width="54" height="54" viewBox="0 0 54 54">
-        <circle cx="27" cy="27" r={R} fill="none" stroke="#1c2230" strokeWidth="4" />
-        <circle cx="27" cy="27" r={R} fill="none" stroke={ACCENT} strokeWidth="4" strokeLinecap="round"
+      <svg width="66" height="66" viewBox="0 0 66 66">
+        <circle cx="33" cy="33" r={R} fill="none" stroke="#1c2230" strokeWidth="4" />
+        <circle cx="33" cy="33" r={R} fill="none" stroke={ACCENT} strokeWidth="4" strokeLinecap="round"
           strokeDasharray={C} strokeDashoffset={off} />
       </svg>
       <div className="gtxt">
-        <div className="gt">{temp != null ? `${temp}°` : "—"}</div>
+        {/* Round to whole degrees so the 0.5° sensor flicker can't jitter the
+            layout or overflow the ring. */}
+        <div className="gt">{temp != null ? `${Math.round(temp)}°` : "—"}</div>
         <div className="gp">{Math.round(pct)}%</div>
       </div>
     </div>
@@ -291,11 +294,101 @@ const GearIcon = (
 const ChevDown = (
   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M6 9l6 6 6-6" /></svg>
 );
+const PencilIcon = (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" />
+  </svg>
+);
 
 function rpmClass(rpm: number) {
   if (rpm === 0) return "fc-rpm zero";
   if (rpm < 400) return "fc-rpm low";
   return "fc-rpm";
+}
+
+// ─── Custom dropdown (native <select> popups are unstyleable / offset) ────────
+
+interface SelectItem {
+  value: string;
+  label: string;
+}
+
+function Select({
+  value,
+  items,
+  onChange,
+  disabled = false,
+  dot = false,
+  className = "",
+  title,
+}: {
+  value: string;
+  items: SelectItem[];
+  onChange: (value: string) => void;
+  disabled?: boolean;
+  /** Render the leading status dot (used by the temp-sensor pickers). */
+  dot?: boolean;
+  className?: string;
+  /** Tooltip on the wrapper — shows even while the trigger is disabled. */
+  title?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    window.addEventListener("mousedown", onDoc);
+    window.addEventListener("keydown", onKey, true);
+    return () => {
+      window.removeEventListener("mousedown", onDoc);
+      window.removeEventListener("keydown", onKey, true);
+    };
+  }, [open]);
+
+  const current = items.find((i) => i.value === value);
+
+  return (
+    <div className={`sel${open ? " open" : ""} ${className}`} ref={ref} title={title}>
+      <button type="button" className="sel-trigger" disabled={disabled} onClick={() => setOpen((o) => !o)}>
+        {dot && <span className="dot" />}
+        <span className="sel-label">{current?.label ?? "—"}</span>
+        <svg className="sel-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M6 9l6 6 6-6" /></svg>
+      </button>
+      {open && (
+        <div className="sel-menu" role="listbox">
+          {items.map((i) => (
+            <button
+              key={i.value}
+              type="button"
+              role="option"
+              aria-selected={i.value === value}
+              className={`sel-opt${i.value === value ? " on" : ""}`}
+              onClick={() => { onChange(i.value); setOpen(false); }}
+            >
+              {i.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Build temp-sensor dropdown items with live °C suffixes. */
+function sensorItems(temps: TempReading[]): SelectItem[] {
+  return (Object.keys(TEMP_SOURCE_LABELS) as TempSourceKey[]).map((k) => {
+    const r = temps.find((t) => t.key === k);
+    return { value: k, label: `${TEMP_SOURCE_LABELS[k]}${r ? ` (${Math.round(r.tempC)}°C)` : ""}` };
+  });
+}
+
+/** Build preset dropdown items, flagging built-ins. */
+function presetItems(profiles: FanProfile[]): SelectItem[] {
+  return profiles.map((p) => ({ value: p.id, label: `${p.name}${p.isBuiltin ? " (built-in)" : ""}` }));
 }
 
 // ─── Fan card ────────────────────────────────────────────────────────────────
@@ -358,9 +451,22 @@ function FanCard({
   const calibrated = mapping.measuredStallRpm != null || mapping.measuredMaxRpm != null;
   const maxRpmNorm = mapping.measuredMaxRpm ?? Math.max(rpm * 1.2, 1500);
 
-  const meta = isManual
-    ? "Manual control"
-    : `${previewProfile?.name ?? "—"} · ${TEMP_SOURCE_LABELS[sensorKey ?? ""] ?? sensorKey ?? ""}`;
+  const meta = isManual ? "Manual control" : previewProfile?.name ?? "—";
+
+  const fanNames = useFans((s) => s.fanNames);
+  const renameFan = useFans((s) => s.renameFan);
+  const displayName = fanNames[mapping.rpmChannel] ?? mapping.headerLabel;
+  const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState(displayName);
+
+  function commitName() {
+    renameFan(mapping.rpmChannel, nameDraft);
+    setEditingName(false);
+  }
+  function startEditName() {
+    setNameDraft(displayName);
+    setEditingName(true);
+  }
 
   function toggleManual() {
     if (isManual) {
@@ -382,9 +488,26 @@ function FanCard({
 
       <div className="fc-head">
         <div className="fc-id">
-          <div className="fc-name">{mapping.headerLabel}</div>
-          <div className="fc-dev">tach ch {mapping.rpmChannel} · header {mapping.header}</div>
-          <div className="fc-meta">{meta}</div>
+          {editingName ? (
+            <input
+              className="fc-name-edit"
+              autoFocus
+              maxLength={24}
+              value={nameDraft}
+              onChange={(e) => setNameDraft(e.target.value)}
+              onBlur={commitName}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") commitName();
+                if (e.key === "Escape") { setNameDraft(displayName); setEditingName(false); }
+              }}
+            />
+          ) : (
+            <div className="fc-name" onDoubleClick={startEditName}>
+              <span className="fc-name-txt">{displayName}</span>
+              <button className="fc-name-edit-btn" onClick={startEditName} title="Rename fan">{PencilIcon}</button>
+            </div>
+          )}
+          <div className="fc-meta"><span className="fc-prof-pill">{meta}</span></div>
           <div className={rpmClass(rpm)}>{rpm.toLocaleString()}<small>RPM</small></div>
         </div>
         <div className="fc-side">
@@ -484,6 +607,152 @@ function PumpCard({ reading, cpuTemp }: { reading: ChannelReading; cpuTemp: numb
   );
 }
 
+// ─── Curve-only editor (profile editing, no fan binding) ─────────────────────
+
+function EditCurveModal({
+  profiles,
+  temps,
+  initialId,
+  onClose,
+}: {
+  profiles: FanProfile[];
+  temps: TempReading[];
+  initialId: string;
+  onClose: () => void;
+}) {
+  const addProfile = useFans((s) => s.addProfile);
+  const updateProfilePoints = useFans((s) => s.updateProfilePoints);
+  const setProfileSource = useFans((s) => s.setProfileSource);
+  const renameProfile = useFans((s) => s.renameProfile);
+  const deleteProfile = useFans((s) => s.deleteProfile);
+
+  const [editId, setEditId] = useState(initialId);
+  const src = profiles.find((p) => p.id === editId) ?? profiles[0];
+  const isBuiltin = src?.isBuiltin ?? true;
+
+  // Local draft — edits stay here until Save, so Cancel discards, built-ins are
+  // never mutated, and nothing is pushed to the running fans mid-edit.
+  const [name, setName] = useState(src?.name ?? "Custom");
+  const [source, setSource] = useState<TempSourceKey>(src?.tempSource ?? "cpu");
+  const [points, setPoints] = useState<CurvePoint[]>(src?.points ?? []);
+  const [showDelete, setShowDelete] = useState(false);
+
+  // Reload the draft whenever the selected preset changes. Built-ins seed a
+  // "<name> copy" name, since Save forks them to a new editable preset.
+  useEffect(() => {
+    const p = profiles.find((x) => x.id === editId);
+    if (!p) return;
+    setName(p.isBuiltin ? `${p.name} copy` : p.name);
+    setSource(p.tempSource);
+    setPoints(p.points.map((q) => ({ ...q })));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editId]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (showDelete) setShowDelete(false);
+      else onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [showDelete, onClose]);
+
+  const tempReading = temps.find((t) => t.key === source);
+
+  function save() {
+    const nm = name.trim() || "Custom Curve";
+    if (isBuiltin) {
+      // Built-ins are immutable — fork the edit into a new custom preset.
+      const id = addProfile(nm);
+      updateProfilePoints(id, points);
+      setProfileSource(id, source);
+    } else {
+      if (nm !== src.name) renameProfile(editId, nm);
+      updateProfilePoints(editId, points);
+      setProfileSource(editId, source);
+    }
+    onClose();
+  }
+
+  function confirmDelete() {
+    deleteProfile(editId);
+    setShowDelete(false);
+    onClose();
+  }
+
+  return (
+    <div className="scrim" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="modal">
+        <div className="modal-head">
+          <div className="mt">{PencilIcon} Edit Fan Curve</div>
+          <button className="x" onClick={onClose}>✕</button>
+        </div>
+
+        <div className="modal-body">
+          <div className="ctl-row">
+            <div className="preset-row">
+              <div className="ctl">
+                <div className="cl">Preset</div>
+                <Select value={editId} items={presetItems(profiles)} onChange={setEditId} />
+              </div>
+              <button className="icon-sq" title={isBuiltin ? "Built-in curve — can't delete" : "Delete curve"} disabled={isBuiltin} onClick={() => setShowDelete(true)}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" /><path d="M10 11v6M14 11v6" /></svg>
+              </button>
+            </div>
+
+            <div className="ctl">
+              <div className="cl">Temperature Sensor</div>
+              <Select dot value={source} items={sensorItems(temps)} onChange={(v) => setSource(v as TempSourceKey)} />
+            </div>
+          </div>
+
+          <div className="ctl" style={{ marginTop: 12 }}>
+            <div className="cl">Curve Name</div>
+            <input
+              className="name-input"
+              maxLength={24}
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="e.g. Cooling"
+            />
+          </div>
+
+          <div style={{ marginTop: 12 }}>
+            <FanCurveEditor points={points} onChange={setPoints} currentTempC={tempReading?.tempC} />
+          </div>
+          {isBuiltin && (
+            <p className="muted" style={{ textAlign: "center", marginTop: 8 }}>
+              Built-in profile · Save creates an editable copy
+            </p>
+          )}
+        </div>
+
+        <div className="modal-foot">
+          <div className="sp" />
+          <button className="mbtn ghost" onClick={onClose}>Cancel</button>
+          <button className="mbtn primary" onClick={save}>{isBuiltin ? "Save as New Preset" : "Save Preset"}</button>
+        </div>
+
+        {showDelete && (
+          <div className="dlg" onClick={(e) => { if (e.target === e.currentTarget) setShowDelete(false); }}>
+            <div className="dlg-card">
+              <h4>Delete Curve <button className="x" onClick={() => setShowDelete(false)}>✕</button></h4>
+              <p className="muted" style={{ margin: "0 0 4px" }}>
+                Delete <strong>{src?.name}</strong>? Fans using it fall back to Balanced. This can't be undone.
+              </p>
+              <div className="dlg-actions">
+                <button className="mbtn ghost" onClick={() => setShowDelete(false)}>Cancel</button>
+                <button className="mbtn danger" onClick={confirmDelete}>Delete</button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── Fan curve modal ─────────────────────────────────────────────────────────
 
 function CurveModal({
@@ -509,11 +778,16 @@ function CurveModal({
   const setProfileSource = useFans((s) => s.setProfileSource);
   const updateProfilePoints = useFans((s) => s.updateProfilePoints);
   const addProfile = useFans((s) => s.addProfile);
+  const renameProfile = useFans((s) => s.renameProfile);
+  const deleteProfile = useFans((s) => s.deleteProfile);
 
   const initial = mode.type === "curve" ? mode.profileId : activeProfileId;
   const [editId, setEditId] = useState(initial);
   const [showDlg, setShowDlg] = useState(false);
   const [name, setName] = useState("Cooling");
+  const [renaming, setRenaming] = useState(false);
+  const [renameDraft, setRenameDraft] = useState("");
+  const [showDelete, setShowDelete] = useState(false);
 
   const editProfile = profiles.find((p) => p.id === editId) ?? profiles[0];
   const isBuiltin = editProfile?.isBuiltin ?? true;
@@ -521,10 +795,16 @@ function CurveModal({
   const tempReading = temps.find((t) => t.key === sensorKey);
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") { if (showDlg) setShowDlg(false); else onClose(); } };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (showDlg) setShowDlg(false);
+      else if (showDelete) setShowDelete(false);
+      else if (renaming) setRenaming(false);
+      else onClose();
+    };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [showDlg, onClose]);
+  }, [showDlg, showDelete, renaming, onClose]);
 
   function pickProfile(id: string) {
     setEditId(id);
@@ -535,6 +815,23 @@ function CurveModal({
     setEditId(id);
     setFanMode(channel, { type: "curve", profileId: id });
     setShowDlg(false);
+  }
+  function startRename() {
+    if (isBuiltin) return;
+    setRenameDraft(editProfile.name);
+    setRenaming(true);
+  }
+  function commitRename() {
+    const t = renameDraft.trim();
+    if (t) renameProfile(editProfile.id, t);
+    setRenaming(false);
+  }
+  function confirmDelete() {
+    // Store reassigns affected fans (and the active profile) to Balanced; point
+    // the editor there too so it doesn't dangle on the deleted id.
+    deleteProfile(editProfile.id);
+    setEditId("balanced");
+    setShowDelete(false);
   }
 
   return (
@@ -549,34 +846,44 @@ function CurveModal({
           <div className="ctl-row">
             <div className="ctl">
               <div className="cl">Temperature Sensor</div>
-              <div className="dropdown">
-                <span className="dot" />
-                <select
-                  value={sensorKey}
-                  disabled={isBuiltin}
-                  onChange={(e) => setProfileSource(editProfile.id, e.target.value as TempSourceKey)}
-                >
-                  {(Object.keys(TEMP_SOURCE_LABELS) as TempSourceKey[]).map((k) => {
-                    const r = temps.find((t) => t.key === k);
-                    return <option key={k} value={k}>{TEMP_SOURCE_LABELS[k]}{r ? ` (${r.tempC}°C)` : ""}</option>;
-                  })}
-                </select>
-              </div>
+              <Select
+                dot
+                value={sensorKey}
+                disabled={isBuiltin}
+                title={isBuiltin ? "Built-in curve is locked — clone it or use “Edit curve” to change the sensor" : undefined}
+                items={sensorItems(temps)}
+                onChange={(v) => setProfileSource(editProfile.id, v as TempSourceKey)}
+              />
             </div>
 
             <div className="preset-row">
               <div className="ctl">
                 <div className="cl">Preset</div>
-                <div className="dropdown">
-                  <select value={editId} onChange={(e) => pickProfile(e.target.value)}>
-                    {profiles.map((p) => (
-                      <option key={p.id} value={p.id}>{p.name}{p.isBuiltin ? " (built-in)" : ""}</option>
-                    ))}
-                  </select>
-                </div>
+                {renaming ? (
+                  <input
+                    className="name-input"
+                    autoFocus
+                    maxLength={24}
+                    value={renameDraft}
+                    onChange={(e) => setRenameDraft(e.target.value)}
+                    onBlur={commitRename}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") commitRename();
+                      if (e.key === "Escape") setRenaming(false);
+                    }}
+                  />
+                ) : (
+                  <Select value={editId} items={presetItems(profiles)} onChange={pickProfile} />
+                )}
               </div>
+              <button className="icon-sq" title={isBuiltin ? "Built-in curve — clone to rename" : "Rename curve"} disabled={isBuiltin} onClick={startRename}>
+                {PencilIcon}
+              </button>
               <button className="icon-sq" title={isBuiltin ? "Clone to edit" : "Duplicate preset"} onClick={() => { setName(`${editProfile.name} copy`); setShowDlg(true); }}>
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15V5a2 2 0 0 1 2-2h10" /></svg>
+              </button>
+              <button className="icon-sq" title={isBuiltin ? "Built-in curve — can't delete" : "Delete curve"} disabled={isBuiltin} onClick={() => setShowDelete(true)}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" /><path d="M10 11v6M14 11v6" /></svg>
               </button>
             </div>
           </div>
@@ -603,7 +910,7 @@ function CurveModal({
             <div className="dlg-card">
               <h4>Create Custom Preset <button className="x" onClick={() => setShowDlg(false)}>✕</button></h4>
               <div className="fl">Preset Name</div>
-              <input autoFocus value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") saveNew(); }} placeholder="e.g. Cooling" />
+              <input autoFocus maxLength={24} value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") saveNew(); }} placeholder="e.g. Cooling" />
               <div className="dlg-actions">
                 <button className="mbtn ghost" onClick={() => setShowDlg(false)}>Cancel</button>
                 <button className="mbtn primary" onClick={saveNew}>Save Preset</button>
@@ -611,6 +918,101 @@ function CurveModal({
             </div>
           </div>
         )}
+
+        {showDelete && (
+          <div className="dlg" onClick={(e) => { if (e.target === e.currentTarget) setShowDelete(false); }}>
+            <div className="dlg-card">
+              <h4>Delete Curve <button className="x" onClick={() => setShowDelete(false)}>✕</button></h4>
+              <p className="muted" style={{ margin: "0 0 4px" }}>
+                Delete <strong>{editProfile?.name}</strong>? Fans using it fall back to Balanced. This can't be undone.
+              </p>
+              <div className="dlg-actions">
+                <button className="mbtn ghost" onClick={() => setShowDelete(false)}>Cancel</button>
+                <button className="mbtn danger" onClick={confirmDelete}>Delete</button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Create-custom-fan-curve modal ──────────────────────────────────────────
+
+function CustomCurveModal({
+  temps,
+  onClose,
+}: {
+  temps: TempReading[];
+  onClose: () => void;
+}) {
+  const addProfile = useFans((s) => s.addProfile);
+  const updateProfilePoints = useFans((s) => s.updateProfilePoints);
+  const setProfileSource = useFans((s) => s.setProfileSource);
+
+  const [name, setName] = useState("My Curve");
+  const [source, setSource] = useState<TempSourceKey>("cpu");
+  const [points, setPoints] = useState<CurvePoint[]>([
+    { tempC: 30, speedPct: 30 },
+    { tempC: 50, speedPct: 45 },
+    { tempC: 65, speedPct: 65 },
+    { tempC: 80, speedPct: 90 },
+    { tempC: 90, speedPct: 100 },
+  ]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const tempReading = temps.find((t) => t.key === source);
+
+  function save() {
+    // addProfile clones from Balanced and selects it; overwrite with our curve
+    // and chosen sensor so it lands in the profile menu ready to apply.
+    const id = addProfile(name.trim() || "Custom Curve");
+    updateProfilePoints(id, points);
+    setProfileSource(id, source);
+    onClose();
+  }
+
+  return (
+    <div className="scrim" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="modal">
+        <div className="modal-head">
+          <div className="mt">{GearIcon} Create Custom Fan Curve</div>
+          <button className="x" onClick={onClose}>✕</button>
+        </div>
+
+        <div className="modal-body">
+          <div className="ctl-row">
+            <div className="ctl">
+              <div className="cl">Curve Name</div>
+              <input
+                className="name-input"
+                autoFocus
+                maxLength={24}
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="e.g. GPU Aggressive"
+              />
+            </div>
+            <div className="ctl">
+              <div className="cl">Temperature Sensor</div>
+              <Select dot value={source} items={sensorItems(temps)} onChange={(v) => setSource(v as TempSourceKey)} />
+            </div>
+          </div>
+
+          <FanCurveEditor points={points} onChange={setPoints} currentTempC={tempReading?.tempC} />
+        </div>
+
+        <div className="modal-foot">
+          <div className="sp" />
+          <button className="mbtn ghost" onClick={onClose}>Cancel</button>
+          <button className="mbtn primary" onClick={save}>Save Curve</button>
+        </div>
       </div>
     </div>
   );
@@ -695,36 +1097,55 @@ export function FanPage() {
   const status = useFans((s) => s.status);
   const readings = useFans((s) => s.readings);
   const temps = useFans((s) => s.temps);
-  const stopping = useFans((s) => s.stopping);
   const sweepingChannel = useFans((s) => s.sweepingChannel);
   const sweepProgress = useFans((s) => s.sweepProgress);
   const profiles = useFans((s) => s.profiles);
   const activeProfileId = useFans((s) => s.activeProfileId);
   const fanModes = useFans((s) => s.fanModes);
 
-  const refresh = useFans((s) => s.refresh);
-  const stop = useFans((s) => s.stop);
   const sweep = useFans((s) => s.sweep);
   const cancelSweep = useFans((s) => s.cancelSweep);
-  const setActiveProfile = useFans((s) => s.setActiveProfile);
+  const applyProfileToAll = useFans((s) => s.applyProfileToAll);
   const setFanMode = useFans((s) => s.setFanMode);
   const setSpeed = useFans((s) => s.setSpeed);
-  const addProfile = useFans((s) => s.addProfile);
 
   const [stoppingCalibration, setStoppingCalibration] = useState(false);
   const [curveChannel, setCurveChannel] = useState<number | null>(null);
+  // Toolbar "Edit curve": profile-only editor, not bound to any fan.
+  const [editCurveOpen, setEditCurveOpen] = useState(false);
+  const [customOpen, setCustomOpen] = useState(false);
 
+  // Live GPU die temp (NVML), so a fan curve can be driven off the GPU. Polled
+  // here for the picker preview; the backend control loop reads it independently.
+  const [gpuTempC, setGpuTempC] = useState<number | null>(null);
   useEffect(() => {
-    void refresh();
-    const t = setInterval(() => void refresh(), POLL_MS);
-    return () => clearInterval(t);
-  }, [refresh]);
+    let alive = true;
+    const tick = async () => {
+      try {
+        const t = await gpuTelemetry();
+        if (alive) setGpuTempC(t.available ? t.tempC : null);
+      } catch {
+        if (alive) setGpuTempC(null);
+      }
+    };
+    void tick();
+    const id = window.setInterval(() => void tick(), 1500);
+    return () => { alive = false; clearInterval(id); };
+  }, []);
+
+  // The fan control loop runs app-wide (see App.tsx) so it survives navigation;
+  // this page only reads the store it populates. No polling started here.
 
   useEffect(() => {
     if (sweepingChannel === null) setStoppingCalibration(false);
   }, [sweepingChannel]);
 
   const mappings = status?.mappings ?? [];
+  // Expose GPU as a selectable temp source alongside the chip sensors.
+  const tempsAll = useMemo(
+    () => (gpuTempC != null ? [...temps, { key: "gpu", label: "GPU", tempC: gpuTempC }] : temps),
+    [temps, gpuTempC],
+  );
   const rpmByChannel = new Map(readings.map((r) => [r.index, r.rpm]));
   const pumpReading = readings.find((r) => r.label === PUMP_LABEL);
   const cpuTemp = temps.find((t) => t.key === "cpu")?.tempC ?? null;
@@ -744,15 +1165,21 @@ export function FanPage() {
       <div className="fan-page">
         {/* toolbar */}
         <div className="fan-bar">
-          <div className="profile-pick">
-            <select value={activeProfileId} onChange={(e) => setActiveProfile(e.target.value)} title="Active profile">
-              {profiles.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-            </select>
-            {ChevDown}
+          <div className="profile-pick-wrap" title="Apply profile to all fans">
+            <Select
+              className="sel-toolbar"
+              value={activeProfileId}
+              items={profiles.map((p) => ({ value: p.id, label: p.name }))}
+              onChange={applyProfileToAll}
+            />
           </div>
-          <button className="new-profile" onClick={() => addProfile(`Custom ${profiles.filter((p) => !p.isBuiltin).length + 1}`, activeProfileId)}>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M12 5v14M5 12h14" /></svg>
-            New Profile
+          <button className="new-profile" title="Edit the selected curve" onClick={() => setEditCurveOpen(true)}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" /></svg>
+            Edit curve
+          </button>
+          <button className="new-profile" onClick={() => setCustomOpen(true)}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 17l5-6 4 4 5-7M3 21h18" /></svg>
+            Create custom fan curve
           </button>
           <button className="calib-all" onClick={() => void calibrateAll()} disabled={!available || sweepingChannel !== null || mappings.length === 0}>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2v4M12 18v4M2 12h4M18 12h4M5 5l2.5 2.5M16.5 16.5L19 19M19 5l-2.5 2.5M7.5 16.5L5 19" /></svg>
@@ -760,21 +1187,6 @@ export function FanPage() {
           </button>
 
           <div className="bar-spacer" />
-
-          <div className="fan-temps">
-            <span className="fan-chip">{status?.chip ?? "Motherboard case fans"}</span>
-            {temps.map((t) => (
-              <span key={t.key}>
-                <b style={{ color: "var(--faint)" }}>{TEMP_SOURCE_LABELS[t.key] ?? t.key}:</b>{" "}
-                <span style={{ color: t.tempC >= 80 ? "var(--bad)" : t.tempC >= 65 ? "var(--warn)" : "var(--good)" }}>{t.tempC}°C</span>
-              </span>
-            ))}
-          </div>
-
-          <button className="stop-bios" onClick={() => void stop()} disabled={!available || stopping || !status?.manualActive}
-            title={status?.manualActive ? "Release all fans back to BIOS" : "No fans under manual control"}>
-            {stopping ? "Releasing…" : "■ STOP → BIOS"}
-          </button>
         </div>
 
         {/* banners */}
@@ -783,7 +1195,7 @@ export function FanPage() {
             <div className="bt">Fan control unavailable</div>
             <div>{status.detail}</div>
             <div style={{ opacity: 0.8, marginTop: 6 }}>
-              KontrolRGB needs to run as Administrator to access the WinRing0 driver and the NCT6687D-R sensor chip. Without it, the BIOS keeps full control.
+              KontrolRGB needs the PawnIO driver installed (from pawnio.eu) and to run as Administrator to access the NCT6687D-R sensor chip. Without it, the BIOS keeps full control.
             </div>
           </div>
         )}
@@ -803,7 +1215,7 @@ export function FanPage() {
               rpm={rpmByChannel.get(m.rpmChannel) ?? 0}
               profiles={profiles}
               mode={fanModes[m.rpmChannel] ?? { type: "curve", profileId: "balanced" }}
-              temps={temps}
+              temps={tempsAll}
               activeProfileId={activeProfileId}
               calibrating={sweepingChannel === m.rpmChannel}
               anySweeping={sweepingChannel !== null}
@@ -825,11 +1237,26 @@ export function FanPage() {
           mapping={curveMapping}
           profiles={profiles}
           mode={fanModes[curveChannel] ?? { type: "curve", profileId: "balanced" }}
-          temps={temps}
+          temps={tempsAll}
           activeProfileId={activeProfileId}
           mappings={mappings}
           onClose={() => setCurveChannel(null)}
         />
+      )}
+
+      {/* curve-only editor (toolbar "Edit curve") */}
+      {editCurveOpen && (
+        <EditCurveModal
+          profiles={profiles}
+          temps={tempsAll}
+          initialId={activeProfileId}
+          onClose={() => setEditCurveOpen(false)}
+        />
+      )}
+
+      {/* create-custom-fan-curve modal */}
+      {customOpen && (
+        <CustomCurveModal temps={tempsAll} onClose={() => setCustomOpen(false)} />
       )}
 
       {/* live calibration modal */}

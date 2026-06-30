@@ -1,10 +1,9 @@
-import { useState } from "react";
 import type { ReactNode } from "react";
 import type { View } from "../App";
 import { useDevices } from "../store/devices";
+import { useFans, fansFullyControlled } from "../store/fans";
 import type { DeviceInfo, DeviceType } from "../types/device";
 import { cssColor } from "../types/device";
-import { EffectPanel } from "./effects/EffectPanel";
 
 /* line-style nav icons (inherit currentColor → tinted by --ac) */
 const TYPE_ICONS: Record<DeviceType, ReactNode> = {
@@ -37,6 +36,12 @@ const TYPE_ACCENT: Record<DeviceType, string> = {
   motherboard: "var(--mb)",
   gpu: "var(--gpu)",
 };
+
+const SyncIcon = (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M21 2v6h-6M3 12a9 9 0 0 1 15-6.7L21 8M3 22v-6h6M21 12a9 9 0 0 1-15 6.7L3 16" />
+  </svg>
+);
 
 const FanIcon = (
   <svg viewBox="0 0 24 24" fill="currentColor">
@@ -82,8 +87,9 @@ export function Sidebar({
   const devices = useDevices((s) => s.devices);
   const selectedId = useDevices((s) => s.selectedId);
   const select = useDevices((s) => s.select);
-  const applyToAll = useDevices((s) => s.applyToAll);
-  const [globalOpen, setGlobalOpen] = useState(false);
+  // Green only when every controllable fan (pump excluded) is on the app, not the
+  // BIOS. Any fan still under BIOS control → dim dot.
+  const fansControlled = useFans(fansFullyControlled);
 
   return (
     <aside className="sidebar">
@@ -105,6 +111,21 @@ export function Sidebar({
           </button>
         </div>
       </div>
+
+      <nav className="nav">
+        <button
+          onClick={() => onChangeView("sync")}
+          className={`nav-item sync-item ${view === "sync" ? "active" : ""}`}
+          style={{ ["--ac" as string]: "var(--accent)" }}
+        >
+          <span className="ico">{SyncIcon}</span>
+          <span className="meta">
+            <span className="name">Sync All</span>
+            <span className="sub">One effect, every device</span>
+          </span>
+          <span className="dot" />
+        </button>
+      </nav>
 
       <div className="sec-label">Lighting</div>
       <nav className="nav">
@@ -143,25 +164,16 @@ export function Sidebar({
             <span className="name">Fan Control</span>
             <span className="sub">Case fans · monitor</span>
           </span>
-          <span className="dot" />
+          <span className={`dot ${fansControlled ? "" : "off"}`}
+            title={fansControlled ? "All fans under app control" : "Some fans on the BIOS curve"} />
         </button>
       </nav>
 
       <div className="foot">
-        <button className="btn-global" onClick={() => setGlobalOpen((o) => !o)}>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M21 2v6h-6M3 12a9 9 0 0 1 15-6.7L21 8M3 22v-6h6M21 12a9 9 0 0 1-15 6.7L3 16" />
-          </svg>
-          {globalOpen ? "Close" : "Sync all devices"}
+        <button className="btn-global" onClick={() => onChangeView("sync")}>
+          {SyncIcon}
+          Sync all devices
         </button>
-        {globalOpen && (
-          <div className="mt-3">
-            <EffectPanel
-              effects={["static", "breathing", "rainbow_wave", "color_cycle"]}
-              onApply={(effect) => applyToAll(effect)}
-            />
-          </div>
-        )}
       </div>
     </aside>
   );

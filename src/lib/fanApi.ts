@@ -136,6 +136,37 @@ export const fanCancelSweep = () => invoke<void>("fan_cancel_sweep");
 /** Keep the watchdog from releasing control while a fan is held. */
 export const fanHeartbeat = () => invoke<void>("fan_heartbeat");
 
+// --- Background control plan ------------------------------------------------
+
+/** One fan-curve point, in the units the backend interpolates. */
+export interface ControlCurvePoint {
+  tempC: number;
+  speedPct: number;
+}
+
+/** How a single fan is driven by the backend control loop. */
+export type ControlMode =
+  | { type: "manual"; pct: number }
+  | { type: "curve"; tempSource: string; points: ControlCurvePoint[] };
+
+/** Full background control plan handed to the backend control loop. */
+export interface FanControlPlan {
+  /** STOP → BIOS: the loop asserts nothing while true. */
+  released: boolean;
+  /** Mode for mapped fans with no explicit entry (e.g. burst-detected). */
+  defaultMode: ControlMode | null;
+  /** Per tach-channel mode. */
+  modes: Record<number, ControlMode>;
+}
+
+/**
+ * Install the background control plan. The backend's in-process loop then holds
+ * every mapped fan to its target every couple of seconds — immune to webview
+ * timer throttling when the window is hidden, unlike the old JS-driven loop.
+ */
+export const fanSetControlPlan = (plan: FanControlPlan) =>
+  invoke<void>("fan_set_control_plan", { plan });
+
 export interface TempReading {
   key: string;
   label: string;

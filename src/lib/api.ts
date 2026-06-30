@@ -38,6 +38,21 @@ export const applyToAll = (effect: EffectConfig, brightness?: number) =>
 
 export const rescanDevices = () => invoke<DeviceInfo[]>("rescan_devices");
 
+// --- GPU telemetry (NVML) -------------------------------------------------
+
+/** Live GPU telemetry. Each metric is null when the driver won't report it. */
+export interface GpuTelemetry {
+  /** NVML loaded and a GPU bound. When false every metric is null. */
+  available: boolean;
+  name: string | null;
+  tempC: number | null;
+  coreClockMhz: number | null;
+  fanPct: number | null;
+  powerW: number | null;
+}
+
+export const gpuTelemetry = () => invoke<GpuTelemetry>("gpu_telemetry");
+
 // --- Startup conflict guard -----------------------------------------------
 
 export interface ConflictProcess {
@@ -53,3 +68,12 @@ export const killRgbConflicts = (pids: number[]) =>
   invoke<void>("kill_rgb_conflicts", { pids });
 
 export const quitApp = () => invoke<void>("quit_app");
+
+// --- Administrator elevation ----------------------------------------------
+
+/** Whether the running process already has administrator rights. */
+export const isElevated = () => invoke<boolean>("is_elevated");
+
+/** Relaunch elevated (pops UAC). On success the current process exits, so the
+ *  promise only ever resolves/rejects when elevation was declined or failed. */
+export const relaunchAsAdmin = () => invoke<void>("relaunch_as_admin");

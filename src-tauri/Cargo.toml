@@ -1,6 +1,6 @@
 [package]
 name = "kontrolrgb"
-version = "0.1.0"
+version = "0.2.0"
 description = "Custom RGB controller for local hardware"
 authors = ["jawad"]
 edition = "2021"
@@ -21,6 +21,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
+tauri-plugin-updater = "2"   # OTA updates via GitHub releases
+tauri-plugin-process = "2"   # restart() after an update is installed
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["time"] }
@@ -32,11 +34,12 @@ sysinfo = "0.32"      # process enumeration for startup conflict guard
 # M4: Gigabyte GPU uses hand-rolled NvAPI FFI, no crate
 
 [target.'cfg(windows)'.dependencies]
-# Dynamically load WinRing0x64.dll for ring-0 LPC/EC port I/O (fan control on
-# the NCT6687D-R). Loaded at runtime so the app still starts without the driver.
+# Dynamically load NVML / NvAPI DLLs at runtime (GPU telemetry + Gigabyte GPU
+# RGB) so the app still starts on machines without them. Fan control no longer
+# uses libloading — it talks to the PawnIO driver via DeviceIoControl (below).
 libloading = "0.8"
-# Raw Win32 for overlapped (async) HID writes — experiment to beat hidapi's
-# ~22ms/write synchronous ceiling. Only used by the ovlbench probe binary.
+# Raw Win32: overlapped HID writes (ovl probe) AND the PawnIO ring-0 fan path
+# (CreateFile + DeviceIoControl to \Device\PawnIO, plus the ISA-bus mutex).
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -44,5 +47,6 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_IO",
     "Win32_System_Threading",
     "Win32_Devices_HumanInterfaceDevice",
+    "Win32_UI_Shell",                       # ShellExecuteW "runas" elevation
 ] }
 

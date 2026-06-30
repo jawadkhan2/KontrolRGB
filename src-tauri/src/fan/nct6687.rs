@@ -298,6 +298,30 @@ struct SavedFan {
     duty: u8,
 }
 
+/// RAII safety net for the fan-config window (`commit_duty`). If the
+/// start→write→commit sequence unwinds early — a `?` propagation, a rejected
+/// commit before retry, or a panic — `drop` returns the request register to idle
+/// so the EC's config window is never left half-open. A stranded-open window is a
+/// suspected cause of the recurring SYS_FAN-stuck / BIOS-config corruption.
+struct FanCfgGuard<'a> {
+    chip: &'a Nct6687,
+    /// Set once `finish_fan_cfg` succeeded; the EC then auto-clears the request,
+    /// so drop must NOT touch it.
+    committed: bool,
+}
+
+impl Drop for FanCfgGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            // Best-effort: clear REQ/DONE so the window returns to the idle state
+            // `start_fan_cfg` expects (req == 0). Errors are ignored — this is the
+            // cleanup path, and we're already holding the ISA lock from commit_duty.
+            let _ = self.chip.ec_write(FAN_PWM_REQUEST_REG, 0);
+            eprintln!("[fan cfg] uncommitted window closed by guard — request cleared");
+        }
+    }
+}
+
 fn is_valid_hwm_base(base: u16) -> bool {
     (MIN_HWM_BASE..=MAX_HWM_BASE).contains(&base) && base & 0x0007 == 0
 }
@@ -324,7 +348,18 @@ impl Nct6687 {
         let mut invalid_base = None;
         let mut ec_error = None;
 
-        for (idx, data) in SIO_PORTS {
+        for (slot, (idx, data)) in SIO_PORTS.into_iter().enumerate() {
+            // Point the PawnIO LpcIO module at this SIO config window; it gates
+            // all port I/O on the selected register port, so this must precede
+            // any inb/outb on the slot. A failure here means the driver/module
+            // isn't usable — skip to the next slot.
+            if lpc.select_slot(slot as u8).is_err() {
+                continue;
+            }
+            // Hold the cross-process ISA-bus mutex for the whole probe sequence so
+            // our unlock→read→find_bars→lock can't interleave with another tool.
+            let _isa = lpc.isa_lock();
+
             // Unlock: write the magic twice to the index port.
             lpc.outb(idx, SIO_UNLOCK);
             lpc.outb(idx, SIO_UNLOCK);
@@ -353,6 +388,11 @@ impl Nct6687 {
             let base_hi = probe.sio_read(idx, data, SIO_BASE_HI);
             let base_lo = probe.sio_read(idx, data, SIO_BASE_LO);
             let base = ((base_hi as u16) << 8) | base_lo as u16;
+
+            // While still in config mode, have the module probe the logical-device
+            // base addresses and allow-list those I/O windows — without this the
+            // EC paged window (base+4/5/6) would be refused by `ioctl_pio_*`.
+            let _ = lpc.find_bars();
 
             // Lock the SIO back before touching the EC window.
             lpc.outb(idx, SIO_LOCK);
@@ -398,27 +438,27 @@ impl Nct6687 {
         }
     }
 
-    /// One-time hardware-monitor init, ported from the nct6687d driver's
-    /// `nct6687_init_device`: ensure the HW monitor / fan engine is running
-    /// (`HWM_CFG` bit 0x80) and enable the SIO voltage inputs. Best-effort —
-    /// errors are ignored. CPU control already works without this, so it's
-    /// belt-and-suspenders aimed at the SYS-fan engine.
+    /// Probe-time sanity check — **read-only on purpose**.
+    ///
+    /// This used to mirror the nct6687d Linux driver's `nct6687_init_device`,
+    /// writing `HWM_CFG` (`0x180` bit 0x80, "start HW monitor") and the SIO
+    /// voltage-input enables (`0x1BB-0x1BF`) on EVERY chip open. Those config
+    /// writes ran every time the subsystem (re)opened the chip and are a prime
+    /// suspect for the recurring SYS_FAN-stuck / BIOS-config corruption — we were
+    /// poking Super-I/O config space the firmware also owns, with no need.
+    ///
+    /// We don't need any of it: detection only reaches here AFTER
+    /// `validate_ec_window` already saw live tachs, which means the BIOS has the
+    /// HW monitor running; and the voltage-input enables are for voltage
+    /// *monitoring*, irrelevant to fan control. So we only READ + log, never
+    /// write. CPU/SYS fan control works without these writes (verified path).
     fn init_device(&self) {
         if let Ok(cfg) = self.ec_read(NCT6687_HWM_CFG) {
             if cfg & 0x80 == 0 {
-                eprintln!("[fan init] HWM_CFG was 0x{cfg:02X}, starting HW monitor");
-                let _ = self.ec_write(NCT6687_HWM_CFG, cfg | 0x80);
+                // Surprising (validate saw live tachs), but never force it — a
+                // write here is exactly the config-space poke we're eliminating.
+                eprintln!("[fan init] HWM_CFG=0x{cfg:02X} (bit7 clear) — leaving firmware untouched");
             }
-        }
-        // Enable SIO voltage inputs (driver parity; harmless for fan control).
-        for (addr, val) in [
-            (0x1BBu16, 0x61u8),
-            (0x1BC, 0x62),
-            (0x1BD, 0x63),
-            (0x1BE, 0x64),
-            (0x1BF, 0x65),
-        ] {
-            let _ = self.ec_write(addr, val);
         }
     }
 
@@ -451,6 +491,9 @@ impl Nct6687 {
 
     /// Read one byte from EC space. Side-effect free w.r.t. fan state.
     fn ec_read(&self, addr: u16) -> Result<u8, ChipError> {
+        // Atomic against other ISA-bus tools for the whole page→index→data→release
+        // sequence (recursive — harmless when a caller already holds it).
+        let _isa = self.lpc.isa_lock();
         let page = (addr >> 8) as u8;
         let index = (addr & 0xFF) as u8;
 
@@ -540,6 +583,9 @@ impl Nct6687 {
     /// Write one byte to EC space. PRIVATE: the only public writers are
     /// `release_to_bios` and, later, `set_manual_pwm` (Phase 2).
     fn ec_write(&self, addr: u16, value: u8) -> Result<(), ChipError> {
+        // Atomic against other ISA-bus tools for the whole page→index→data→release
+        // sequence (recursive — harmless when a caller already holds it).
+        let _isa = self.lpc.isa_lock();
         let page = (addr >> 8) as u8;
         let index = (addr & 0xFF) as u8;
         let deadline = Instant::now() + Duration::from_millis(500);
@@ -621,6 +667,8 @@ impl Nct6687 {
         let Some(saved) = saved else {
             return Ok(()); // we never took this header — leave it alone
         };
+        // Atomic vs other tools across mode-bit restore + commit (recursive lock).
+        let _isa = self.lpc.isa_lock();
         let ctl = &FAN_CTL[index];
         let mode = self.ec_read(ctl.mode_reg)?;
         let new_mode = (mode & !(1u8 << ctl.mode_bit)) | saved.mode_bit;
@@ -697,13 +745,33 @@ impl Nct6687 {
     /// Open the config window, write `duty` to the header's command register, and
     /// commit — retrying the whole cycle up to 3× if the EC rejects it (INVALID),
     /// mirroring LHM's retry loop. The caller must already hold the manual bit.
+    ///
+    /// SAFETY (corruption hardening): the request→write→commit must not be split.
+    ///  * The WHOLE handshake runs under a single ISA-bus lock so another tool
+    ///    (MSI Center / HWiNFO) can't touch SIO/EC while our config window is
+    ///    open. The lock is recursive, so the per-access locks inside each
+    ///    `ec_read`/`ec_write` nest harmlessly.
+    ///  * A `FanCfgGuard` closes the window even if a `?` early-return or a panic
+    ///    unwinds out mid-handshake: leaving the request bit set would strand the
+    ///    EC's fan engine half-configured across the next open (a suspected
+    ///    BIOS-corruption vector). On any uncommitted exit it returns the request
+    ///    register to idle.
     fn commit_duty(&self, index: usize, duty: u8) -> Result<(), ChipError> {
+        let _isa = self.lpc.isa_lock();
         let mut last_err = ChipError::FanConfigCommitTimeout;
         for _ in 0..3 {
+            let mut guard = FanCfgGuard {
+                chip: self,
+                committed: false,
+            };
             self.start_fan_cfg()?; // a start failure is fatal — don't retry it
             self.write_duty(index, duty)?;
             match self.finish_fan_cfg() {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    guard.committed = true; // EC auto-clears the request on commit
+                    return Ok(());
+                }
+                // guard drops here → request register returned to idle before retry
                 Err(e) => last_err = e,
             }
         }
@@ -722,6 +790,10 @@ impl Nct6687 {
     /// RPM so a manual test is conclusive.
     pub fn set_manual_pwm(&self, index: usize, duty: u8) -> Result<(), ChipError> {
         let ctl = FAN_CTL.get(index).ok_or(ChipError::EcUnresponsive(0))?;
+        // Hold the ISA bus across mode-bit set + commit so the manual-bit write and
+        // the handshake land as one atomic sequence vs other tools (recursive with
+        // commit_duty's own lock and the per-access locks).
+        let _isa = self.lpc.isa_lock();
         // Remember the BIOS state before our first write so STOP can restore it.
         self.save_initial(index)?;
         // Enable direct-PWM manual mode by SETTING this header's manual bit. Every

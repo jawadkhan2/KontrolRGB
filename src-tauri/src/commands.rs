@@ -441,10 +441,42 @@ pub async fn fan_ec_capture(
 }
 
 /// UI heartbeat: keep the watchdog from releasing control while a fan is held.
-/// Non-blocking (`try_lock`), so it's safe to leave synchronous.
+/// Non-blocking (`try_lock`), so it's safe to leave synchronous. Mostly vestigial
+/// now that the backend control loop self-beats; kept for the manual-write path.
 #[tauri::command]
 pub fn fan_heartbeat(state: State<'_, Arc<AppState>>) {
     state.fan.heartbeat();
+}
+
+/// Install the background fan-control plan (per-fan curve/manual modes). The
+/// backend's control loop owns it from here, driving each mapped fan on its own
+/// thread — so fans keep tracking temperature even when the window is hidden and
+/// its JS timers are throttled. Pushed by the UI on any mode/curve/STOP change.
+#[tauri::command]
+pub async fn fan_set_control_plan(
+    state: State<'_, Arc<AppState>>,
+    plan: crate::fan::FanControlPlan,
+) -> CmdResult<()> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || state.fan.set_control_plan(plan))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// --- GPU telemetry (NVML) -------------------------------------------------
+
+/// Live GPU temp / core clock / fan % / power for the GPU page. Polled ~1/s by
+/// the frontend. Off-loaded to a blocking thread: the first call lazily loads
+/// `nvml.dll`, and NVML's getters, while quick, are still FFI we keep off the
+/// webview's main thread. Reports `available: false` with no driver/GPU.
+#[tauri::command]
+pub async fn gpu_telemetry(
+    state: State<'_, Arc<AppState>>,
+) -> CmdResult<crate::gpu_telemetry::GpuTelemetry> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || state.gpu_telemetry.read())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // --- Startup conflict guard -----------------------------------------------
@@ -475,4 +507,23 @@ pub fn quit_app(app: AppHandle, state: State<'_, Arc<AppState>>) {
     let _ = state.fan.release_to_bios();
     crate::persistence::save_now(&app, &state);
     app.exit(0);
+}
+
+/// Whether the current process is running with administrator rights.
+#[tauri::command]
+pub fn is_elevated() -> bool {
+    crate::admin::is_elevated()
+}
+
+/// Relaunch the app elevated (pops UAC). On success the elevated instance is
+/// starting, so we cleanly shut this one down — release fans and flush config
+/// first, exactly like a normal quit, to avoid leaving a fan stranded or losing
+/// unsaved settings. If the user declines UAC we return the error and stay put.
+#[tauri::command]
+pub fn relaunch_as_admin(app: AppHandle, state: State<'_, Arc<AppState>>) -> CmdResult<()> {
+    crate::admin::relaunch_as_admin()?;
+    let _ = state.fan.release_to_bios();
+    crate::persistence::save_now(&app, &state);
+    app.exit(0);
+    Ok(())
 }

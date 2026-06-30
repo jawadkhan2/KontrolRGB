@@ -36,16 +36,29 @@ use nct6687::Nct6687;
 pub use nct6687::{ChannelReading, SweepResult, TempReading};
 use safety::FanLimits;
 
+use crate::gpu_telemetry::GpuTelemetrySubsystem;
+
 pub const CONTROLLABLE_CHANNEL_COUNT: u8 = 8;
 pub const RPM_CHANNEL_COUNT: u8 = 16;
 const PUMP_HEADER_INDEX: u8 = 1;
 
-/// If the UI stops sending heartbeats for this long while we hold manual
-/// control, the watchdog hands the fans back to the BIOS. The Fan page pings
-/// every poll (~1.5s), so this tolerates a couple of missed frames before
-/// assuming the UI died.
+/// Failsafe: if the in-process control loop stops refreshing this heartbeat
+/// while we hold manual control, hand the fans back to the BIOS so a hung or
+/// panicked controller can't strand a fan at a fixed duty.
+///
+/// Control now lives in a backend thread (`start_control_loop`) that beats every
+/// `CONTROL_INTERVAL` regardless of window state, so a healthy app always pings
+/// well inside this window — webview timer throttling (which crippled the old
+/// JS-driven loop when minimized) no longer matters. Only a genuinely dead
+/// control thread trips this, after which the BIOS safely manages thermals.
 #[cfg(windows)]
-const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(6);
+const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often the backend control loop re-evaluates every mapped fan's target
+/// (curve interpolation or manual duty) and writes the chip. Runs on its own OS
+/// thread so it is immune to webview timer throttling when the window is hidden.
+#[cfg(windows)]
+const CONTROL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -62,6 +75,45 @@ pub struct FanConfig {
     pub pwm_map: std::collections::HashMap<u8, u8>,
     #[serde(default)]
     pub limits: std::collections::HashMap<u8, FanLimits>,
+}
+
+/// One point on a fan curve, pushed from the frontend as part of a control plan.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CurvePoint {
+    #[serde(rename = "tempC")]
+    pub temp_c: f32,
+    #[serde(rename = "speedPct")]
+    pub speed_pct: f32,
+}
+
+/// How one fan should be driven: a fixed manual duty, or a temperature curve.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum FanControlMode {
+    Manual {
+        pct: f32,
+    },
+    Curve {
+        #[serde(rename = "tempSource")]
+        temp_source: String,
+        points: Vec<CurvePoint>,
+    },
+}
+
+/// The background fan-control plan, pushed by the UI whenever the user changes a
+/// mode, edits a curve, or engages/releases control. The backend control loop
+/// owns it from then on, so fans keep tracking temperature even when the window
+/// is hidden and its JS timers are throttled.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FanControlPlan {
+    /// While true the loop asserts nothing (user pressed STOP → BIOS).
+    pub released: bool,
+    /// Mode for a mapped fan with no explicit per-channel entry (e.g. a fan
+    /// freshly found by burst auto-detect). `None` leaves such fans on the BIOS.
+    pub default_mode: Option<FanControlMode>,
+    /// Per tach-channel mode. Channels not in the device's PWM map are ignored.
+    pub modes: std::collections::HashMap<u8, FanControlMode>,
 }
 
 /// Non-Windows builds have no ring-0 path; these types still need to exist so
@@ -204,6 +256,18 @@ pub struct FanSubsystem {
     /// Cancel flag for an in-flight `sweep`. Lives OUTSIDE the mutex so the Stop
     /// button can set it while the sweep thread holds the lock for the whole run.
     sweep_cancel: Arc<AtomicBool>,
+    /// Suspends the control loop for the duration of a burst/sweep so it can't
+    /// write the chip between the long op's lock-release windows.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    control_suspend: Arc<AtomicBool>,
+    /// Shared with `AppState`: the control loop refuses to write until competing
+    /// RGB/fan software has been cleared.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    conflicts_cleared: Arc<AtomicBool>,
+    /// Shared with `AppState`: lets a fan curve be driven off the GPU die temp.
+    /// Read each control pass and surfaced as the synthetic `"gpu"` temp source.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    gpu_telemetry: Arc<GpuTelemetrySubsystem>,
 }
 
 struct Inner {
@@ -229,10 +293,22 @@ struct Inner {
     /// Baseline EC snapshot for the passive capture/diff tool (`ec_capture`).
     #[cfg(windows)]
     ec_baseline: Option<Vec<(u16, u8)>>,
+    /// Background control plan pushed from the UI; owned by the control loop.
+    #[cfg(windows)]
+    control_plan: Option<FanControlPlan>,
+    /// Set once the control loop thread has been spawned (lazily, on first plan).
+    #[cfg(windows)]
+    control_started: bool,
+    /// Last duty (%) the control loop commanded per tach channel (2% dedup).
+    #[cfg(windows)]
+    control_last_commanded: std::collections::HashMap<u8, u8>,
 }
 
 impl FanSubsystem {
-    pub fn new() -> Self {
+    pub fn new(
+        conflicts_cleared: Arc<AtomicBool>,
+        gpu_telemetry: Arc<GpuTelemetrySubsystem>,
+    ) -> Self {
         FanSubsystem {
             inner: Arc::new(Mutex::new(Inner {
                 #[cfg(windows)]
@@ -248,8 +324,17 @@ impl FanSubsystem {
                 watchdog_started: false,
                 #[cfg(windows)]
                 ec_baseline: None,
+                #[cfg(windows)]
+                control_plan: None,
+                #[cfg(windows)]
+                control_started: false,
+                #[cfg(windows)]
+                control_last_commanded: Default::default(),
             })),
             sweep_cancel: Arc::new(AtomicBool::new(false)),
+            control_suspend: Arc::new(AtomicBool::new(false)),
+            conflicts_cleared,
+            gpu_telemetry,
         }
     }
 
@@ -581,6 +666,9 @@ impl FanSubsystem {
         use nct6687::rpm_channel_for_header;
         use std::collections::HashMap;
 
+        // Hold the control loop off the chip for the whole burst (auto-restored).
+        let _suspend = SuspendGuard::new(self.control_suspend.clone());
+
         /// How often we sample RPM during the burst.
         const SAMPLE: Duration = Duration::from_millis(500);
 
@@ -798,6 +886,8 @@ impl FanSubsystem {
         rpm_channel: u8,
         on_progress: impl Fn(u8, u16, &'static str),
     ) -> Result<SweepResult, FanError> {
+        // Hold the control loop off the chip for the whole sweep (auto-restored).
+        let _suspend = SuspendGuard::new(self.control_suspend.clone());
         // Clear any stale cancel request from a previous run before we begin.
         self.sweep_cancel.store(false, Ordering::Relaxed);
         let mut inner = self.inner.lock();
@@ -848,6 +938,115 @@ impl FanSubsystem {
     #[cfg(not(windows))]
     pub fn heartbeat(&self) {}
 
+    /// Install/replace the background control plan and ensure the control loop is
+    /// running. The loop then drives every mapped fan to its target each
+    /// `CONTROL_INTERVAL`, independent of the UI's (throttleable) timers. Pushing
+    /// a new plan re-evaluates every fan on the next pass.
+    #[allow(unused_variables)]
+    pub fn set_control_plan(&self, plan: FanControlPlan) {
+        #[cfg(windows)]
+        {
+            let need_start;
+            {
+                let mut inner = self.inner.lock();
+                inner.control_plan = Some(plan);
+                // Force a re-apply on the next pass; the config just changed.
+                inner.control_last_commanded.clear();
+                need_start = !inner.control_started;
+                if need_start {
+                    inner.control_started = true;
+                }
+            }
+            if need_start {
+                start_control_loop(
+                    self.inner.clone(),
+                    self.control_suspend.clone(),
+                    self.conflicts_cleared.clone(),
+                    self.gpu_telemetry.clone(),
+                );
+            }
+        }
+    }
+
+    /// One control-loop pass: drive every mapped fan to its planned target.
+    /// Curve fans interpolate against the live chip temps; manual fans hold their
+    /// fixed duty. Skipped writes (≤2% from last) keep EC traffic down. Refreshes
+    /// the watchdog heartbeat so a running loop is never reclaimed by the BIOS.
+    #[cfg(windows)]
+    fn control_pass(inner_arc: &Arc<Mutex<Inner>>, gpu: &Arc<GpuTelemetrySubsystem>) {
+        let mut inner = inner_arc.lock();
+        let Some(plan) = inner.control_plan.clone() else {
+            return;
+        };
+        if plan.released {
+            return;
+        }
+        Self::ensure_open(&mut inner);
+
+        // Read GPU die temp before taking the chip borrow, so a curve bound to the
+        // "gpu" source tracks the card. Cheap NVML query; unavailable → no "gpu"
+        // reading, and such a curve simply holds (matches a missing chip sensor).
+        let gpu_temp = gpu.read().temp_c;
+
+        let mut commanded = inner.control_last_commanded.clone();
+        let mut held = false;
+        {
+            let Some(chip) = inner.chip.as_ref() else {
+                return;
+            };
+            let mut temps = match chip.read_temps() {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            if let Some(t) = gpu_temp {
+                temps.push(TempReading {
+                    key: "gpu".to_string(),
+                    label: "GPU".to_string(),
+                    temp_c: t as f32,
+                });
+            }
+            for (&rpm_channel, &header) in inner.pwm_map.iter() {
+                if header == PUMP_HEADER_INDEX {
+                    continue;
+                }
+                held = true;
+                let Some(mode) = plan.modes.get(&rpm_channel).or(plan.default_mode.as_ref())
+                else {
+                    continue;
+                };
+                let raw = match mode {
+                    FanControlMode::Manual { pct } => *pct,
+                    FanControlMode::Curve {
+                        temp_source,
+                        points,
+                    } => {
+                        let Some(tr) = temps.iter().find(|r| r.key == *temp_source) else {
+                            continue;
+                        };
+                        interpolate_curve(points, tr.temp_c)
+                    }
+                };
+                let limits = inner.limits.get(&header).cloned().unwrap_or_default();
+                let clamped = limits.clamp_pct(raw.round().clamp(0.0, 100.0) as u8);
+                let changed = commanded
+                    .get(&rpm_channel)
+                    .is_none_or(|&l| (clamped as i32 - l as i32).abs() > 2);
+                if changed {
+                    let duty = ((clamped as u16 * 255) / 100) as u8;
+                    if chip.set_manual_pwm(header as usize, duty).is_ok() {
+                        commanded.insert(rpm_channel, clamped);
+                    }
+                }
+            }
+        }
+
+        inner.control_last_commanded = commanded;
+        if held {
+            inner.manual_session_active = true;
+            inner.last_heartbeat = Instant::now();
+        }
+    }
+
     pub fn config(&self) -> FanConfig {
         let inner = self.inner.lock();
         FanConfig {
@@ -887,10 +1086,87 @@ impl FanSubsystem {
     }
 }
 
-/// Background guard: if the UI stops sending heartbeats while we hold manual
-/// control, hand the fans back to the BIOS so a crashed/frozen/closed UI can
-/// never strand a fan at a fixed (possibly low) duty. Spawned once, lives for
-/// the process.
+/// Linear interpolation of a fan curve at `temp_c`, clamped to the endpoints.
+/// Mirrors the frontend's `interpolateCurve` so previews match what we command.
+#[cfg(windows)]
+fn interpolate_curve(points: &[CurvePoint], temp_c: f32) -> f32 {
+    if points.is_empty() {
+        return 50.0;
+    }
+    let mut pts: Vec<&CurvePoint> = points.iter().collect();
+    pts.sort_by(|a, b| {
+        a.temp_c
+            .partial_cmp(&b.temp_c)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let first = pts[0];
+    let last = pts[pts.len() - 1];
+    if temp_c <= first.temp_c {
+        return first.speed_pct;
+    }
+    if temp_c >= last.temp_c {
+        return last.speed_pct;
+    }
+    for w in pts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if temp_c >= a.temp_c && temp_c <= b.temp_c {
+            let t = (temp_c - a.temp_c) / (b.temp_c - a.temp_c);
+            return a.speed_pct + t * (b.speed_pct - a.speed_pct);
+        }
+    }
+    last.speed_pct
+}
+
+/// Background fan-control loop: every `CONTROL_INTERVAL`, drive each mapped fan
+/// to its planned target. Runs on a dedicated OS thread, so it keeps tracking
+/// temperature even when the window is hidden and its JS timers are throttled —
+/// the reason the heartbeat watchdog can stay tight. Idles while the plan is
+/// released, while a burst/sweep holds the chip (`suspend`), or before the user
+/// has cleared conflicting software (`conflicts_cleared`).
+#[cfg(windows)]
+fn start_control_loop(
+    inner: Arc<Mutex<Inner>>,
+    suspend: Arc<AtomicBool>,
+    conflicts_cleared: Arc<AtomicBool>,
+    gpu_telemetry: Arc<GpuTelemetrySubsystem>,
+) {
+    std::thread::Builder::new()
+        .name("fan-control".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(CONTROL_INTERVAL);
+            if suspend.load(Ordering::Relaxed) || !conflicts_cleared.load(Ordering::Relaxed) {
+                continue;
+            }
+            FanSubsystem::control_pass(&inner, &gpu_telemetry);
+        })
+        .ok();
+}
+
+/// Suspends the control loop for its lifetime, restoring on drop. Used to fence
+/// a burst/sweep so the loop can't write the chip between the op's lock-release
+/// windows.
+#[cfg(windows)]
+struct SuspendGuard(Arc<AtomicBool>);
+
+#[cfg(windows)]
+impl SuspendGuard {
+    fn new(flag: Arc<AtomicBool>) -> Self {
+        flag.store(true, Ordering::Relaxed);
+        SuspendGuard(flag)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SuspendGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Background guard: if the control loop stops refreshing the heartbeat while we
+/// hold manual control, hand the fans back to the BIOS so a crashed/frozen UI or
+/// a hung controller can never strand a fan at a fixed (possibly low) duty.
+/// Spawned once, lives for the process.
 #[cfg(windows)]
 fn start_watchdog(inner: Arc<Mutex<Inner>>) {
     std::thread::spawn(move || loop {
@@ -911,6 +1187,9 @@ fn start_watchdog(inner: Arc<Mutex<Inner>>) {
 
 impl Default for FanSubsystem {
     fn default() -> Self {
-        Self::new()
+        Self::new(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(GpuTelemetrySubsystem::new()),
+        )
     }
 }
