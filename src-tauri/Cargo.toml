@@ -1,6 +1,6 @@
 [package]
 name = "kontrolrgb"
-version = "0.2.0"
+version = "0.2.1"
 description = "Custom RGB controller for local hardware"
 authors = ["jawad"]
 edition = "2021"
