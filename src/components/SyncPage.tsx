@@ -2,14 +2,13 @@ import { useEffect, useMemo } from "react";
 import type { ReactNode } from "react";
 import type { View } from "../App";
 import { useDevices } from "../store/devices";
-import { useSettings } from "../store/settings";
-import type {
-  Color,
-  DeviceInfo,
-  DeviceType,
-  EffectConfig,
-  OnboardMode,
-} from "../types/device";
+import { useSettings, type SyncEffectId } from "../store/settings";
+import type { Color, DeviceInfo, DeviceType } from "../types/device";
+import {
+  EFFECTS,
+  capabilityFor,
+  configForDevice,
+} from "../lib/effectRegistry";
 import { ColorPickerPopover } from "./effects/ColorPickerPopover";
 
 /* line-style device icons (inherit currentColor → tinted by --ac) */
@@ -49,28 +48,9 @@ const CHECK = (
   </svg>
 );
 
-/* One effect, every device. Each maps to a host-animated kind plus the closest
-   firmware (onboard) mode for devices that can't host-animate it (the GMMK). */
-type SyncEffectId = "static" | "breathing" | "rainbow_wave" | "color_cycle";
-
-interface SyncEffect {
-  id: SyncEffectId;
-  label: string;
-  pv: string;
-  usesColor: boolean;
-  usesSpeed: boolean;
-  usesDirection: boolean;
-  /** Firmware mode used as the closest match on write-once devices. */
-  onboardMode: OnboardMode;
-  onboardRainbow: boolean;
-}
-
-const SYNC_EFFECTS: SyncEffect[] = [
-  { id: "static",       label: "Static",       pv: "pv-static",  usesColor: true,  usesSpeed: false, usesDirection: false, onboardMode: "fixed",     onboardRainbow: false },
-  { id: "breathing",    label: "Breathing",    pv: "pv-breathe", usesColor: true,  usesSpeed: true,  usesDirection: false, onboardMode: "breathing", onboardRainbow: false },
-  { id: "rainbow_wave", label: "Rainbow Wave", pv: "pv-wave",    usesColor: false, usesSpeed: true,  usesDirection: true,  onboardMode: "wave",      onboardRainbow: true },
-  { id: "color_cycle",  label: "Color Cycle",  pv: "pv-cycle",   usesColor: false, usesSpeed: true,  usesDirection: false, onboardMode: "spectrum",  onboardRainbow: true },
-];
+/* One effect, every device. The browsable registry effects, each carrying the
+   closest firmware (onboard) mode for devices that can't host-animate (GMMK). */
+const SYNC_EFFECTS = EFFECTS.filter((e) => e.browsable);
 
 const PRESETS: Color[] = [
   { r: 91, g: 140, b: 255 },  // blue
@@ -83,52 +63,6 @@ const PRESETS: Color[] = [
 ];
 
 const sameColor = (a: Color, b: Color) => a.r === b.r && a.g === b.g && a.b === b.b;
-
-/** native = host can animate it · fallback = only via firmware · none = can't. */
-type Capability = "native" | "fallback" | "none";
-
-function capabilityFor(device: DeviceInfo, effect: SyncEffect): Capability {
-  if (device.supported_effects.includes(effect.id)) return "native";
-  if (device.supported_effects.includes("onboard")) return "fallback";
-  return "none";
-}
-
-function buildConfig(
-  device: DeviceInfo,
-  effect: SyncEffect,
-  color: Color,
-  speedPct: number,
-  reverse: boolean,
-): EffectConfig | null {
-  const cap = capabilityFor(device, effect);
-  // Host effects take a 0.1..5× float; firmware modes take a 0..4 integer.
-  const speedFloat = Math.min(5, Math.max(0.1, (speedPct / 100) * 5));
-  const speedInt = Math.round((speedPct / 100) * 4);
-
-  if (cap === "native") {
-    switch (effect.id) {
-      case "static":
-        return { kind: "static", color };
-      case "breathing":
-        return { kind: "breathing", color, speed: speedFloat };
-      case "rainbow_wave":
-        return { kind: "rainbow_wave", speed: speedFloat, reverse };
-      case "color_cycle":
-        return { kind: "color_cycle", speed: speedFloat };
-    }
-  }
-  if (cap === "fallback") {
-    return {
-      kind: "onboard",
-      mode: effect.onboardMode,
-      color,
-      rainbow: effect.onboardRainbow,
-      speed: speedInt,
-      reverse: effect.usesDirection ? reverse : false,
-    };
-  }
-  return null;
-}
 
 function deviceSub(device: DeviceInfo): string {
   if (device.device_type === "keyboard") {
@@ -163,7 +97,7 @@ export function SyncPage({ onChangeView }: { onChangeView: (v: View) => void }) 
   const excluded = useSettings((s) => s.syncExcluded);
   const setExcluded = useSettings((s) => s.setSyncExcluded);
 
-  const effect = SYNC_EFFECTS.find((e) => e.id === effectId)!;
+  const effect = SYNC_EFFECTS.find((e) => e.kind === effectId)!;
 
   const isIncluded = (id: string) => !excluded[id];
 
@@ -171,7 +105,7 @@ export function SyncPage({ onChangeView }: { onChangeView: (v: View) => void }) 
   const plan = useMemo(
     () =>
       devices.map((d) => {
-        const cap = capabilityFor(d, effect);
+        const cap = capabilityFor(d.supported_effects, effect);
         const included = isIncluded(d.id);
         const skippedByFallback = cap === "fallback" && fallbackMode === "exclude";
         const live = included && cap !== "none" && !skippedByFallback;
@@ -192,7 +126,11 @@ export function SyncPage({ onChangeView }: { onChangeView: (v: View) => void }) 
     const t = setTimeout(() => {
       for (const p of plan) {
         if (!p.live) continue;
-        const cfg = buildConfig(p.device, effect, color, speed, reverse);
+        const cfg = configForDevice(p.device.supported_effects, effect, {
+          color,
+          speedPct: speed,
+          reverse,
+        });
         if (cfg) applyEffect(p.device.id, cfg);
       }
     }, 80);
@@ -272,9 +210,7 @@ export function SyncPage({ onChangeView }: { onChangeView: (v: View) => void }) 
           {plan.map(({ device, cap, included }) => {
             const off = !included || cap === "none";
             const badge =
-              included && cap === "fallback"
-                ? `≈ ${SYNC_EFFECTS.find((e) => e.id === effect.id)!.label}`
-                : null;
+              included && cap === "fallback" ? `≈ ${effect.label}` : null;
             return (
               <button
                 key={device.id}
@@ -307,9 +243,9 @@ export function SyncPage({ onChangeView }: { onChangeView: (v: View) => void }) 
               <div className="effect-grid">
                 {SYNC_EFFECTS.map((e) => (
                   <button
-                    key={e.id}
-                    className={`fx ${e.id === effectId ? "on" : ""}`}
-                    onClick={() => setEffectId(e.id)}
+                    key={e.kind}
+                    className={`fx ${e.kind === effectId ? "on" : ""}`}
+                    onClick={() => setEffectId(e.kind as SyncEffectId)}
                   >
                     <div className={`pv ${e.pv}`} />
                     <div className="nm">{e.label}</div>
@@ -322,7 +258,7 @@ export function SyncPage({ onChangeView }: { onChangeView: (v: View) => void }) 
           <div className="card">
             <div className="card-head"><h3>Settings</h3></div>
             <div className="card-pad">
-              <div className={`color-block ${effect.usesColor ? "" : "dim"}`}>
+              <div className={`color-block ${effect.supports.color ? "" : "dim"}`}>
                 <div className="muted" style={{ marginBottom: 9 }}>Color</div>
                 <div className="swatch-row" style={{ marginBottom: 14 }}>
                   {PRESETS.map((c, i) => (
@@ -337,7 +273,7 @@ export function SyncPage({ onChangeView }: { onChangeView: (v: View) => void }) 
                 </div>
               </div>
               <div style={{ borderTop: "1px solid var(--line)", paddingTop: 6 }}>
-                {effect.usesSpeed && (
+                {effect.supports.speed && (
                   <div className="ctrl-row">
                     <span className="lbl">Speed</span>
                     <input
@@ -351,7 +287,7 @@ export function SyncPage({ onChangeView }: { onChangeView: (v: View) => void }) 
                     />
                   </div>
                 )}
-                {effect.usesDirection && (
+                {effect.supports.direction && (
                   <div className="ctrl-row">
                     <span className="lbl">Direction</span>
                     <div className="seg-ctrl">
@@ -360,7 +296,7 @@ export function SyncPage({ onChangeView }: { onChangeView: (v: View) => void }) 
                     </div>
                   </div>
                 )}
-                {!effect.usesSpeed && !effect.usesDirection && (
+                {!effect.supports.speed && !effect.supports.direction && (
                   <p className="muted" style={{ margin: "4px 0 0" }}>
                     A solid color held on every device. Pick a hue above.
                   </p>

@@ -57,8 +57,11 @@ const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the backend control loop re-evaluates every mapped fan's target
 /// (curve interpolation or manual duty) and writes the chip. Runs on its own OS
 /// thread so it is immune to webview timer throttling when the window is hidden.
+/// 1s so a temperature spike moves the fans within a second; each pass is a few
+/// cheap EC reads plus at most one duty write per fan (2% dedup), so the faster
+/// cadence adds negligible EC traffic.
 #[cfg(windows)]
-const CONTROL_INTERVAL: Duration = Duration::from_secs(2);
+const CONTROL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -919,6 +922,66 @@ impl FanSubsystem {
         _rpm_channel: u8,
         _on_progress: impl Fn(u8, u16, &'static str),
     ) -> Result<SweepResult, FanError> {
+        Err(FanError::Unavailable(
+            "fan control is Windows-only".to_string(),
+        ))
+    }
+
+    /// Sweep every mapped, non-pump fan simultaneously ("Calibrate all"): all
+    /// fans walk the same duty ladder together, so a whole-system calibration
+    /// takes roughly one sweep's wall time instead of one per fan. Folds each
+    /// result into that header's safety limits, exactly like a single `sweep`.
+    /// `on_progress(rpm_channel, pct, rpm, phase)` streams per-fan samples
+    /// (phase `"settling"` / `"measuring"` / `"done"`). Returns
+    /// `(rpm_channel, result)` pairs.
+    #[cfg(windows)]
+    pub fn sweep_all(
+        &self,
+        on_progress: impl Fn(u8, u8, u16, &'static str),
+    ) -> Result<Vec<(u8, SweepResult)>, FanError> {
+        // Hold the control loop off the chip for the whole sweep (auto-restored).
+        let _suspend = SuspendGuard::new(self.control_suspend.clone());
+        // Clear any stale cancel request from a previous run before we begin.
+        self.sweep_cancel.store(false, Ordering::Relaxed);
+        let mut inner = self.inner.lock();
+        let mut targets: Vec<(usize, usize)> = inner
+            .pwm_map
+            .iter()
+            .filter(|&(_, &header)| header != PUMP_HEADER_INDEX)
+            .map(|(&rpm_channel, &header)| (header as usize, rpm_channel as usize))
+            .collect();
+        targets.sort_by_key(|&(_, ch)| ch);
+        if targets.is_empty() {
+            return Err(FanError::Refused("no mapped fans to calibrate".to_string()));
+        }
+        Self::ensure_open(&mut inner);
+        let chip = inner
+            .chip
+            .as_ref()
+            .ok_or_else(|| FanError::Unavailable(inner.detail.clone()))?;
+        let results = chip.sweep_headers(&targets, &self.sweep_cancel, &|channel, pct, rpm, phase| {
+            on_progress(channel as u8, pct, rpm, phase)
+        })?;
+        // sweep_headers restores every header to BIOS itself (also on cancel,
+        // where it returns SweepCancelled and we never touch the limits below).
+        inner.manual_session_active = false;
+        let mut out = Vec::with_capacity(targets.len());
+        for (&(header, rpm_channel), result) in targets.iter().zip(results) {
+            inner
+                .limits
+                .entry(header as u8)
+                .or_default()
+                .apply_sweep(&result);
+            out.push((rpm_channel as u8, result));
+        }
+        Ok(out)
+    }
+
+    #[cfg(not(windows))]
+    pub fn sweep_all(
+        &self,
+        _on_progress: impl Fn(u8, u8, u16, &'static str),
+    ) -> Result<Vec<(u8, SweepResult)>, FanError> {
         Err(FanError::Unavailable(
             "fan control is Windows-only".to_string(),
         ))

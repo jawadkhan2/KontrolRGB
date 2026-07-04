@@ -67,6 +67,7 @@ pub fn run() {
             commands::fan_burst_detect,
             commands::fan_set_speed,
             commands::fan_sweep,
+            commands::fan_sweep_all,
             commands::fan_cancel_sweep,
             commands::fan_ec_capture,
             commands::fan_heartbeat,

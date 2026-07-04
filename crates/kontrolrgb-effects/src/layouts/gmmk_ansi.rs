@@ -3,7 +3,7 @@
 //! backend (M2) will remap `led_index` to the wire order while reusing the
 //! same geometry.
 
-use crate::device::types::KeyInfo;
+use crate::types::KeyInfo;
 
 struct K(&'static str, f32, f32, f32, f32); // label, x, y, w, h
 

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { DevicePage } from "./components/DevicePage";
+import { EffectsLibraryPage } from "./components/EffectsLibraryPage";
 import { SyncPage } from "./components/SyncPage";
 import { FanPage } from "./components/FanPage";
 import { SettingsPage } from "./components/SettingsPage";
@@ -19,7 +20,7 @@ import { useDevices } from "./store/devices";
 import { useFans } from "./store/fans";
 import { useSettings } from "./store/settings";
 
-export type View = "sync" | "devices" | "fans" | "settings";
+export type View = "sync" | "devices" | "library" | "fans" | "settings";
 
 /**
  * Display refresh cadence for live fan readings. This only updates the UI —
@@ -39,7 +40,15 @@ export default function App() {
   const devices = useDevices((s) => s.devices);
   const selectedId = useDevices((s) => s.selectedId);
   const [view, setView] = useState<View>("sync");
+  // Effects Library apply target: "all" or a device id. The sidebar opens it on
+  // "all"; a device page's "Browse all" opens it preselected to that device.
+  const [libraryTarget, setLibraryTarget] = useState<string>("all");
   const [conflicts, setConflicts] = useState<ConflictProcess[] | null>(null);
+
+  const openLibrary = (target: string) => {
+    setLibraryTarget(target);
+    setView("library");
+  };
 
   // Active section accent → drives the page glow + shared control colors.
   const selectedType = devices.find((d) => d.id === selectedId)?.device_type;
@@ -134,15 +143,17 @@ export default function App() {
       <BurstDebugModal />
       <TitleBar />
       <div className="flex min-h-0 flex-1">
-        <Sidebar view={view} onChangeView={setView} />
+        <Sidebar view={view} onChangeView={setView} onOpenLibrary={() => openLibrary("all")} />
         {view === "sync" ? (
           <SyncPage onChangeView={setView} />
+        ) : view === "library" ? (
+          <EffectsLibraryPage target={libraryTarget} onChangeTarget={setLibraryTarget} />
         ) : view === "fans" ? (
           <FanPage />
         ) : view === "settings" ? (
           <SettingsPage />
         ) : (
-          <DevicePage />
+          <DevicePage onOpenLibrary={openLibrary} />
         )}
       </div>
     </div>

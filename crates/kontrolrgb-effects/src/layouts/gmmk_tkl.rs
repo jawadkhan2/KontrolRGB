@@ -9,7 +9,7 @@
 //! The numpad keys (`Num_*`) of the full 104-key table are intentionally
 //! dropped — this board has no numpad.
 
-use crate::device::types::KeyInfo;
+use crate::types::KeyInfo;
 
 pub struct GmmkKey {
     pub label: &'static str,

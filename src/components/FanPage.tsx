@@ -1091,6 +1091,70 @@ function CalibrationModal({
   );
 }
 
+// ─── Calibrate-all progress modal ────────────────────────────────────────────
+
+function CalibrationAllModal({
+  mappings, progress, onStop, stopping,
+}: {
+  mappings: FanMapping[];
+  progress: Record<number, SweepProgress>;
+  onStop: () => void;
+  stopping: boolean;
+}) {
+  const doneCount = mappings.filter((m) => progress[m.rpmChannel]?.phase === "done").length;
+
+  return (
+    <div className="scrim">
+      <div className="modal" style={{ width: "26rem" }}>
+        <div className="modal-body">
+          <div className="flex items-center gap-3">
+            <svg viewBox="0 0 24 24" className="h-5 w-5 animate-spin" style={{ color: ACCENT }} fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M21 12a9 9 0 1 1-6.22-8.56" strokeLinecap="round" />
+            </svg>
+            <div>
+              <h3 className="text-base font-bold">Calibrating all fans</h3>
+              <p className="text-xs text-faint">All fans sweep the duty ladder together — {doneCount}/{mappings.length} done</p>
+            </div>
+          </div>
+
+          <div className="mt-4 space-y-2">
+            {mappings.map((m) => {
+              const p = progress[m.rpmChannel];
+              const done = p?.phase === "done";
+              const settling = p?.phase === "settling";
+              return (
+                <div key={m.rpmChannel} className="flex items-center gap-3 rounded-xl bg-panel-2 px-3 py-2">
+                  <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${done ? "bg-good" : settling ? "bg-warn animate-pulse" : "bg-good"}`} />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm font-semibold">{m.headerLabel}</div>
+                    <div className="text-[11px] text-faint">
+                      {done ? "Done — back on BIOS curve" : p ? (settling ? "Settling…" : "Measuring…") : "Starting…"}
+                    </div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-sm font-bold tabular-nums text-text">{(p?.rpm ?? 0).toLocaleString()} <span className="text-[10px] font-normal text-faint">RPM</span></div>
+                    <div className="text-[11px] tabular-nums" style={{ color: ACCENT }}>{p?.pct ?? 100}% duty</div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="mt-4 rounded-lg border border-amber-700/40 bg-amber-950/30 px-3 py-2 text-[11px] leading-relaxed text-amber-200/80">
+            Every fan is measured simultaneously, so this takes about as long as calibrating one fan. Fans finish independently and return to the BIOS curve as they complete — don't close the app.
+          </div>
+
+          <button onClick={onStop} disabled={stopping}
+            className="mt-3 w-full rounded-lg bg-red-600/90 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-red-500 disabled:cursor-not-allowed disabled:opacity-50">
+            {stopping ? "Stopping…" : "■ Stop calibration"}
+          </button>
+          <p className="mt-3 text-center text-[11px] text-faint">All fans return to the BIOS curve automatically when finished or stopped.</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Main page ───────────────────────────────────────────────────────────────
 
 export function FanPage() {
@@ -1098,12 +1162,14 @@ export function FanPage() {
   const readings = useFans((s) => s.readings);
   const temps = useFans((s) => s.temps);
   const sweepingChannel = useFans((s) => s.sweepingChannel);
+  const sweepingAll = useFans((s) => s.sweepingAll);
   const sweepProgress = useFans((s) => s.sweepProgress);
   const profiles = useFans((s) => s.profiles);
   const activeProfileId = useFans((s) => s.activeProfileId);
   const fanModes = useFans((s) => s.fanModes);
 
   const sweep = useFans((s) => s.sweep);
+  const sweepAll = useFans((s) => s.sweepAll);
   const cancelSweep = useFans((s) => s.cancelSweep);
   const applyProfileToAll = useFans((s) => s.applyProfileToAll);
   const setFanMode = useFans((s) => s.setFanMode);
@@ -1137,8 +1203,8 @@ export function FanPage() {
   // this page only reads the store it populates. No polling started here.
 
   useEffect(() => {
-    if (sweepingChannel === null) setStoppingCalibration(false);
-  }, [sweepingChannel]);
+    if (sweepingChannel === null && !sweepingAll) setStoppingCalibration(false);
+  }, [sweepingChannel, sweepingAll]);
 
   const mappings = status?.mappings ?? [];
   // Expose GPU as a selectable temp source alongside the chip sensors.
@@ -1153,12 +1219,7 @@ export function FanPage() {
 
   const curveMapping = curveChannel != null ? mappings.find((m) => m.rpmChannel === curveChannel) : null;
 
-  async function calibrateAll() {
-    for (const m of mappings) {
-      // eslint-disable-next-line no-await-in-loop
-      await sweep(m.rpmChannel);
-    }
-  }
+  const anySweeping = sweepingChannel !== null || sweepingAll;
 
   return (
     <main className="main">
@@ -1181,9 +1242,9 @@ export function FanPage() {
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 17l5-6 4 4 5-7M3 21h18" /></svg>
             Create custom fan curve
           </button>
-          <button className="calib-all" onClick={() => void calibrateAll()} disabled={!available || sweepingChannel !== null || mappings.length === 0}>
+          <button className="calib-all" title="Calibrate every fan simultaneously" onClick={() => void sweepAll()} disabled={!available || anySweeping || mappings.length === 0}>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2v4M12 18v4M2 12h4M18 12h4M5 5l2.5 2.5M16.5 16.5L19 19M19 5l-2.5 2.5M7.5 16.5L5 19" /></svg>
-            Calibrate all
+            {sweepingAll ? "Calibrating…" : "Calibrate all"}
           </button>
 
           <div className="bar-spacer" />
@@ -1217,8 +1278,11 @@ export function FanPage() {
               mode={fanModes[m.rpmChannel] ?? { type: "curve", profileId: "balanced" }}
               temps={tempsAll}
               activeProfileId={activeProfileId}
-              calibrating={sweepingChannel === m.rpmChannel}
-              anySweeping={sweepingChannel !== null}
+              calibrating={
+                sweepingChannel === m.rpmChannel ||
+                (sweepingAll && sweepProgress[m.rpmChannel]?.phase !== "done")
+              }
+              anySweeping={anySweeping}
               available={available}
               onSetMode={(mode) => setFanMode(m.rpmChannel, mode)}
               onSetSpeed={(pct) => void setSpeed(m.rpmChannel, pct)}
@@ -1257,6 +1321,16 @@ export function FanPage() {
       {/* create-custom-fan-curve modal */}
       {customOpen && (
         <CustomCurveModal temps={tempsAll} onClose={() => setCustomOpen(false)} />
+      )}
+
+      {/* live calibrate-all modal */}
+      {sweepingAll && (
+        <CalibrationAllModal
+          mappings={mappings}
+          progress={sweepProgress}
+          stopping={stoppingCalibration}
+          onStop={() => { setStoppingCalibration(true); void cancelSweep(); }}
+        />
       )}
 
       {/* live calibration modal */}

@@ -811,18 +811,8 @@ impl Nct6687 {
         Ok(())
     }
 
-    /// Sweep a mapped header's duty from full down toward zero, recording the
-    /// tach RPM at each step, to measure this fan's real top RPM and stall
-    /// point. This is the ONE writer allowed below the safety floor — it is how
-    /// the floor is discovered. Bounded (stops at the first stall or 5%), under
-    /// continuous tach watch, and restores the header to BIOS when finished.
-    ///
-    /// `on_progress(pct, rpm, phase)` is called for each measured point and on
-    /// every poll with phase `"settling"` while a step's RPM is stabilizing, so
-    /// the UI can show live duty/RPM — the subsystem lock is held for the whole
-    /// sweep, so polling can't read it any other way. Each step uses an adaptive
-    /// settle (waits only until the RPM stops changing), so a full sweep is fast
-    /// when the fan reacts quickly and only slows for genuinely sluggish movers.
+    /// Sweep one mapped header — the single-fan entry point for the per-fan
+    /// "Calibrate" button. Thin wrapper over [`Self::sweep_headers`].
     pub fn sweep_header(
         &self,
         header: usize,
@@ -830,17 +820,49 @@ impl Nct6687 {
         cancel: &AtomicBool,
         on_progress: &dyn Fn(u8, u16, &'static str),
     ) -> Result<SweepResult, ChipError> {
-        if header >= FAN_CTL.len() {
+        let mut results = self.sweep_headers(
+            &[(header, rpm_channel)],
+            cancel,
+            &|_channel, pct, rpm, phase| on_progress(pct, rpm, phase),
+        )?;
+        Ok(results.pop().expect("one target in, one result out"))
+    }
+
+    /// Sweep a set of mapped headers' duties from full down toward zero
+    /// simultaneously, recording each tach's RPM at every step, to measure each
+    /// fan's real top RPM and stall point. This is the ONE writer allowed below
+    /// the safety floor — it is how the floor is discovered. All fans walk the
+    /// same duty ladder together, so a whole-system calibration costs one sweep's
+    /// wall time (each step waits for the slowest fan) instead of one per fan.
+    /// Bounded per fan (stops at its first confirmed stall or 5%), under
+    /// continuous tach watch; each fan is handed back to the BIOS the moment it
+    /// finishes (stall confirmed or ladder exhausted).
+    ///
+    /// `targets` is `(header, rpm_channel)` pairs. `on_progress(rpm_channel,
+    /// pct, rpm, phase)` fires per fan: `"settling"` on every poll while a step
+    /// stabilizes, `"measuring"` for each recorded point, and `"done"` once that
+    /// fan is finished and released — the subsystem lock is held for the whole
+    /// sweep, so the UI can't read live RPM any other way. Each step uses an
+    /// adaptive settle (waits only until every polled fan's RPM stops changing),
+    /// so the sweep is fast when fans react quickly and only slows for genuinely
+    /// sluggish movers. Results come back in `targets` order.
+    pub fn sweep_headers(
+        &self,
+        targets: &[(usize, usize)],
+        cancel: &AtomicBool,
+        on_progress: &dyn Fn(usize, u8, u16, &'static str),
+    ) -> Result<Vec<SweepResult>, ChipError> {
+        if targets.is_empty() || targets.iter().any(|&(h, _)| h >= FAN_CTL.len()) {
             return Err(ChipError::EcUnresponsive(0));
         }
         const STEP_PCT: i32 = 5;
         const FLOOR_PCT: i32 = 5;
 
         // Adaptive settle: instead of waiting a fixed window per step, poll the
-        // tach and move on the moment the RPM stops changing. A fan at high duty
-        // settles in well under a second; only the slow spin-down near the floor
-        // needs the full budget. Result is a much faster sweep *and* a reading
-        // taken at true steady-state rather than mid-ramp.
+        // tachs and move on the moment every fan's RPM stops changing. A fan at
+        // high duty settles in well under a second; only the slow spin-down near
+        // the floor needs the full budget. Result is a much faster sweep *and*
+        // readings taken at true steady-state rather than mid-ramp.
         const POLL: Duration = Duration::from_millis(250);
         // Floor must be long enough that the fan has actually started reacting —
         // otherwise the first samples still read the PREVIOUS duty's RPM, look
@@ -857,87 +879,170 @@ impl Nct6687 {
 
         let pct_to_duty = |pct: i32| ((pct.clamp(0, 100) as u16 * 255) / 100) as u8;
 
-        // Drive `pct`, then poll until the RPM holds steady (or MAX_SETTLE), and
-        // return the settled reading. Polls in POLL slices so a Stop lands within
-        // ~250ms even mid-settle; on cancel, hand the header back to the BIOS and
-        // bail. Each poll is emitted as a "settling" sample so the UI shows the
-        // fan ramping (the subsystem lock is held for the whole sweep, so this is
-        // the only place a live RPM exists).
-        let settle_read = |pct: u8, min_settle: Duration, max_settle: Duration| -> Result<u16, ChipError> {
+        /// Per-fan sweep bookkeeping while the group walks the shared ladder.
+        struct FanState {
+            header: usize,
+            channel: usize,
+            /// Still on the ladder (not yet stalled/released).
+            active: bool,
+            /// Last RPM read this settle window.
+            last: u16,
+            /// Rolling stability window for the current settle.
+            recent: Vec<u16>,
+            samples: Vec<(u8, u16)>,
+            max_rpm: u16,
+            min_running_pct: u8,
+            min_running_rpm: u16,
+            stall_pct: Option<u8>,
+        }
+
+        let mut fans: Vec<FanState> = targets
+            .iter()
+            .map(|&(header, channel)| FanState {
+                header,
+                channel,
+                active: true,
+                last: 0,
+                recent: Vec::with_capacity(STABLE_N),
+                samples: Vec::new(),
+                max_rpm: 0,
+                min_running_pct: 100,
+                min_running_rpm: 0,
+                stall_pct: None,
+            })
+            .collect();
+
+        // Hold the current duty, then poll the fans in `poll` until each one's
+        // RPM is steady (or `max_settle`), leaving the settled reading in
+        // `last`. Fans not in `poll` just keep their duty untouched. Polls in
+        // POLL slices so a Stop lands within ~250ms even mid-settle; on cancel,
+        // hand every still-held header back to the BIOS and bail. Each poll is
+        // emitted as a "settling" sample so the UI shows the fans ramping.
+        let settle_group = |fans: &mut [FanState],
+                            poll: &[usize],
+                            pct: u8,
+                            min_settle: Duration,
+                            max_settle: Duration|
+         -> Result<(), ChipError> {
+            for &i in poll {
+                fans[i].recent.clear();
+            }
             let start = Instant::now();
-            let mut recent: Vec<u16> = Vec::with_capacity(STABLE_N);
-            let mut last = 0u16;
             loop {
                 if cancel.load(Ordering::Relaxed) {
-                    let _ = self.release_header(header);
+                    for f in fans.iter().filter(|f| f.active) {
+                        let _ = self.release_header(f.header);
+                    }
                     return Err(ChipError::SweepCancelled);
                 }
-                if let Ok(rpm) = self.read_rpm(rpm_channel) {
-                    last = rpm;
-                    on_progress(pct, rpm, "settling");
-                    if recent.len() == STABLE_N {
-                        recent.remove(0);
+                for &i in poll {
+                    if let Ok(rpm) = self.read_rpm(fans[i].channel) {
+                        fans[i].last = rpm;
+                        on_progress(fans[i].channel, pct, rpm, "settling");
+                        if fans[i].recent.len() == STABLE_N {
+                            fans[i].recent.remove(0);
+                        }
+                        fans[i].recent.push(rpm);
                     }
-                    recent.push(rpm);
                 }
                 let elapsed = start.elapsed();
                 if elapsed >= max_settle {
-                    return Ok(last);
+                    return Ok(());
                 }
-                if elapsed >= min_settle && recent.len() == STABLE_N {
-                    let lo = *recent.iter().min().unwrap();
-                    let hi = *recent.iter().max().unwrap();
-                    let band = STABLE_FLOOR_RPM.max(hi.saturating_mul(STABLE_PCT) / 100);
-                    if hi - lo <= band {
-                        return Ok(last);
+                if elapsed >= min_settle {
+                    let all_stable = poll.iter().all(|&i| {
+                        let recent = &fans[i].recent;
+                        if recent.len() < STABLE_N {
+                            return false;
+                        }
+                        let lo = *recent.iter().min().unwrap();
+                        let hi = *recent.iter().max().unwrap();
+                        let band = STABLE_FLOOR_RPM.max(hi.saturating_mul(STABLE_PCT) / 100);
+                        hi - lo <= band
+                    });
+                    if all_stable {
+                        return Ok(());
                     }
                 }
                 sleep(POLL);
             }
         };
 
-        // Top end: full duty.
-        on_progress(100, 0, "settling");
-        self.set_manual_pwm(header, 255)?;
-        let max_rpm = settle_read(100, TOP_MIN_SETTLE, TOP_MAX_SETTLE)?;
-        on_progress(100, max_rpm, "measuring");
-
-        let mut samples = vec![(100u8, max_rpm)];
-        let mut min_running_pct = 100u8;
-        let mut min_running_rpm = max_rpm;
-        let mut stall_pct = None;
+        // Top end: every fan to full duty at once.
+        let all: Vec<usize> = (0..fans.len()).collect();
+        for f in &fans {
+            on_progress(f.channel, 100, 0, "settling");
+            self.set_manual_pwm(f.header, 255)?;
+        }
+        settle_group(&mut fans, &all, 100, TOP_MIN_SETTLE, TOP_MAX_SETTLE)?;
+        for f in &mut fans {
+            f.max_rpm = f.last;
+            f.min_running_rpm = f.last;
+            f.samples.push((100, f.last));
+            on_progress(f.channel, 100, f.last, "measuring");
+        }
 
         // Start the descent just below the conservative floor and walk down.
+        // Fans that stall drop off the ladder (and go back to the BIOS); the
+        // rest keep descending together.
         let mut pct = 50i32;
-        while pct >= FLOOR_PCT {
-            on_progress(pct as u8, 0, "settling");
-            self.set_manual_pwm(header, pct_to_duty(pct))?;
-            let mut rpm = settle_read(pct as u8, MIN_SETTLE, MAX_SETTLE)?;
-            // A reading of 0 can be a transient mid-coast sample rather than a real
-            // stall, so re-settle once and confirm before declaring the floor.
-            if rpm == 0 {
-                rpm = settle_read(pct as u8, MIN_SETTLE, MAX_SETTLE)?;
+        while pct >= FLOOR_PCT && fans.iter().any(|f| f.active) {
+            let poll: Vec<usize> = fans
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.active)
+                .map(|(i, _)| i)
+                .collect();
+            for &i in &poll {
+                on_progress(fans[i].channel, pct as u8, 0, "settling");
+                self.set_manual_pwm(fans[i].header, pct_to_duty(pct))?;
+            }
+            settle_group(&mut fans, &poll, pct as u8, MIN_SETTLE, MAX_SETTLE)?;
+            // A reading of 0 can be a transient mid-coast sample rather than a
+            // real stall, so re-settle just the zero readers once and confirm
+            // before declaring their floor (the others simply hold their duty).
+            let zeros: Vec<usize> = poll.iter().copied().filter(|&i| fans[i].last == 0).collect();
+            if !zeros.is_empty() {
+                settle_group(&mut fans, &zeros, pct as u8, MIN_SETTLE, MAX_SETTLE)?;
+            }
+            for &i in &poll {
+                let rpm = fans[i].last;
+                let f = &mut fans[i];
                 if rpm == 0 {
-                    on_progress(pct as u8, 0, "measuring");
-                    samples.push((pct as u8, 0));
-                    stall_pct = Some(pct as u8);
-                    break;
+                    on_progress(f.channel, pct as u8, 0, "measuring");
+                    f.samples.push((pct as u8, 0));
+                    f.stall_pct = Some(pct as u8);
+                    f.active = false;
+                    self.release_header(f.header)?;
+                    on_progress(f.channel, pct as u8, 0, "done");
+                } else {
+                    on_progress(f.channel, pct as u8, rpm, "measuring");
+                    f.samples.push((pct as u8, rpm));
+                    f.min_running_pct = pct as u8;
+                    f.min_running_rpm = rpm;
                 }
             }
-            on_progress(pct as u8, rpm, "measuring");
-            samples.push((pct as u8, rpm));
-            min_running_pct = pct as u8;
-            min_running_rpm = rpm;
             pct -= STEP_PCT;
         }
 
-        self.release_header(header)?;
-        Ok(SweepResult {
-            max_rpm,
-            min_running_pct,
-            min_running_rpm,
-            stall_pct,
-            samples,
-        })
+        // Fans that never stalled in range: release and finish.
+        for f in &mut fans {
+            if f.active {
+                f.active = false;
+                self.release_header(f.header)?;
+                on_progress(f.channel, f.min_running_pct, f.min_running_rpm, "done");
+            }
+        }
+
+        Ok(fans
+            .into_iter()
+            .map(|f| SweepResult {
+                max_rpm: f.max_rpm,
+                min_running_pct: f.min_running_pct,
+                min_running_rpm: f.min_running_rpm,
+                stall_pct: f.stall_pct,
+                samples: f.samples,
+            })
+            .collect())
     }
 }

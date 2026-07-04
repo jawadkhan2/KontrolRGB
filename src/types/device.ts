@@ -59,6 +59,14 @@ export type EffectConfig =
   | { kind: "rainbow_wave"; speed: number; reverse: boolean }
   | { kind: "color_cycle"; speed: number }
   | { kind: "custom" }
+  | { kind: "meteor"; color: Color; speed: number; reverse: boolean }
+  | { kind: "fire"; speed: number }
+  | { kind: "twinkle"; color: Color; speed: number }
+  | { kind: "gradient"; color: Color; speed: number }
+  | { kind: "plasma"; speed: number }
+  | { kind: "larson"; color: Color; speed: number }
+  | { kind: "theater_chase"; color: Color; speed: number }
+  | { kind: "ripple"; speed: number }
   // Serde flattens the OnboardEffect fields alongside the tag.
   | ({ kind: "onboard" } & OnboardEffect);
 

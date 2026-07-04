@@ -14,7 +14,19 @@ const LEGACY_FAN_KEY = "kontrolrgb-fan-state-v1";
 export type SyncFallbackMode = "fallback" | "exclude";
 
 /** The four host-animated effects the Sync page can apply to every device. */
-export type SyncEffectId = "static" | "breathing" | "rainbow_wave" | "color_cycle";
+export type SyncEffectId =
+  | "static"
+  | "breathing"
+  | "rainbow_wave"
+  | "color_cycle"
+  | "meteor"
+  | "fire"
+  | "twinkle"
+  | "gradient"
+  | "plasma"
+  | "larson"
+  | "theater_chase"
+  | "ripple";
 
 interface PersistedSettings {
   /**
@@ -46,6 +58,8 @@ interface PersistedSettings {
   /** Devices the user excluded from the sync. Keyed by device id; missing or
    *  false = included. */
   syncExcluded: Record<string, boolean>;
+  /** Effect kinds starred in the Effects Library. Order = order starred. */
+  favoriteEffects: string[];
 }
 
 /** Default burst hold; long enough for slow movers (SYS_FAN 5/6) to spin up. */
@@ -87,6 +101,7 @@ interface SettingsStore extends PersistedSettings {
   setSyncSpeed: (speed: number) => void;
   setSyncReverse: (reverse: boolean) => void;
   setSyncExcluded: (excluded: Record<string, boolean>) => void;
+  toggleFavoriteEffect: (kind: string) => void;
 }
 
 const saved = loadSaved();
@@ -105,6 +120,7 @@ function persist(get: () => SettingsStore) {
     syncSpeed: s.syncSpeed,
     syncReverse: s.syncReverse,
     syncExcluded: s.syncExcluded,
+    favoriteEffects: s.favoriteEffects,
   });
 }
 
@@ -120,6 +136,7 @@ export const useSettings = create<SettingsStore>((set, get) => ({
   syncSpeed: saved.syncSpeed ?? 55,
   syncReverse: saved.syncReverse ?? false,
   syncExcluded: saved.syncExcluded ?? {},
+  favoriteEffects: saved.favoriteEffects ?? [],
 
   setFanControlOnStartup: (enabled) => {
     set({ fanControlOnStartup: enabled });
@@ -167,6 +184,15 @@ export const useSettings = create<SettingsStore>((set, get) => ({
   },
   setSyncExcluded: (excluded) => {
     set({ syncExcluded: excluded });
+    persist(get);
+  },
+  toggleFavoriteEffect: (kind) => {
+    const favs = get().favoriteEffects;
+    set({
+      favoriteEffects: favs.includes(kind)
+        ? favs.filter((k) => k !== kind)
+        : [...favs, kind],
+    });
     persist(get);
   },
 }));

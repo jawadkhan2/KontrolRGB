@@ -150,6 +150,8 @@ interface FansStore {
   released: boolean;
   mappingChannel: number | null;
   sweepingChannel: number | null;
+  /** True while a simultaneous "Calibrate all" sweep runs (all mapped fans). */
+  sweepingAll: boolean;
   sweepResults: Record<number, SweepResult>;
   /** Live sweep progress per channel (cleared when a sweep starts). */
   sweepProgress: Record<number, SweepProgress>;
@@ -179,6 +181,8 @@ interface FansStore {
   mapHeader: (rpmChannel: number) => Promise<void>;
   setSpeed: (rpmChannel: number, pct: number) => Promise<void>;
   sweep: (rpmChannel: number) => Promise<void>;
+  /** Calibrate every mapped fan simultaneously (one shared duty ladder). */
+  sweepAll: () => Promise<void>;
   cancelSweep: () => Promise<void>;
   runBurstDetect: () => Promise<void>;
 
@@ -252,6 +256,7 @@ export const useFans = create<FansStore>((set, get) => ({
   released: !useSettings.getState().fanControlOnStartup,
   mappingChannel: null,
   sweepingChannel: null,
+  sweepingAll: false,
   sweepResults: {},
   sweepProgress: {},
 
@@ -275,7 +280,7 @@ export const useFans = create<FansStore>((set, get) => ({
     // While a sweep or burst runs, the backend holds the chip lock; reading
     // through it would block a worker and pile up polls. The calibration/burst
     // modals update from their own progress events, so skip the polled read.
-    if (get().sweepingChannel !== null) return;
+    if (get().sweepingChannel !== null || get().sweepingAll) return;
     if (get().burstDetecting) return;
 
     try {
@@ -375,6 +380,28 @@ export const useFans = create<FansStore>((set, get) => ({
       // Clear the channel BEFORE refreshing so `refresh` doesn't skip itself, and
       // so the UI reflects the fan being handed back to the BIOS curve.
       set({ sweepingChannel: null });
+      await get().refresh().catch(() => {});
+    }
+  },
+
+  sweepAll: async () => {
+    if (get().sweepingAll || get().sweepingChannel !== null) return;
+    // Fresh progress map so the modal starts empty for every fan.
+    set({ sweepingAll: true, sweepProgress: {} });
+    try {
+      const results = await fanApi.fanSweepAll();
+      set((s) => ({
+        sweepResults: { ...s.sweepResults, ...Object.fromEntries(results) },
+      }));
+    } catch (e) {
+      // A user Stop returns a "sweep cancelled" error — expected, not a failure.
+      if (!String(e).toLowerCase().includes("cancel")) {
+        console.error("fan sweep-all failed", e);
+      }
+    } finally {
+      // Clear BEFORE refreshing so `refresh` doesn't skip itself, and so the UI
+      // reflects the fans being handed back to the BIOS curve.
+      set({ sweepingAll: false });
       await get().refresh().catch(() => {});
     }
   },

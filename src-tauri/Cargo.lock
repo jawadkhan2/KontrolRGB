@@ -1977,9 +1977,10 @@ dependencies = [
 
 [[package]]
 name = "kontrolrgb"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "hidapi",
+ "kontrolrgb-effects",
  "libloading 0.8.9",
  "parking_lot",
  "serde",
@@ -1993,6 +1994,14 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "kontrolrgb-effects"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -419,6 +419,41 @@ pub async fn fan_sweep(
     .await
 }
 
+/// Sweep every mapped, non-pump fan simultaneously ("Calibrate all"): all fans
+/// walk the same duty ladder together, so the whole run costs about one sweep's
+/// wall time instead of one per fan. Emits `fan-sweep-progress` per fan per
+/// sample (same event as a single sweep, keyed by `rpmChannel`). Returns
+/// `(rpmChannel, result)` pairs.
+#[tauri::command]
+pub async fn fan_sweep_all(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> CmdResult<Vec<(u8, crate::fan::SweepResult)>> {
+    fan_blocking(&state, move |s| {
+        if !s.conflicts_cleared.load(Ordering::Relaxed) {
+            return Err(crate::fan::FanError::Refused(
+                "kill conflicting processes first".into(),
+            ));
+        }
+        let result = s.fan.sweep_all(|rpm_channel, pct, rpm, phase| {
+            let _ = app.emit(
+                "fan-sweep-progress",
+                SweepProgress {
+                    rpm_channel,
+                    pct,
+                    rpm,
+                    phase,
+                },
+            );
+        })?;
+        // Same immediate persist as a single sweep — don't lose minutes of
+        // calibration to the debounce if the user closes the app right after.
+        crate::persistence::save_now(&app, s);
+        Ok(result)
+    })
+    .await
+}
+
 /// Cancel an in-flight sweep (the modal's Stop button). Lock-free, so it lands
 /// even though the sweep thread holds the subsystem lock the whole time; the
 /// sweep releases the fan back to the BIOS and returns a cancelled error.

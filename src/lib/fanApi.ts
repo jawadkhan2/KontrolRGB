@@ -51,8 +51,12 @@ export interface SweepProgress {
   rpmChannel: number;
   pct: number;
   rpm: number;
-  /** "settling" while a step stabilizes, "measuring" once the RPM is read. */
-  phase: "settling" | "measuring";
+  /**
+   * "settling" while a step stabilizes, "measuring" once the RPM is read,
+   * "done" once this fan has finished and been handed back to the BIOS
+   * (emitted per fan during a sweep-all, where fans finish at different steps).
+   */
+  phase: "settling" | "measuring" | "done";
 }
 
 /** Result of an RPM sweep: top RPM, lowest running duty, and stall point. */
@@ -130,6 +134,15 @@ export const fanSetSpeed = (rpmChannel: number, pct: number) =>
 export const fanSweep = (rpmChannel: number) =>
   invoke<SweepResult>("fan_sweep", { rpmChannel });
 
+/**
+ * Sweep every mapped, non-pump fan simultaneously ("Calibrate all"): all fans
+ * walk the same duty ladder together, so the whole run costs about one sweep's
+ * wall time. Streams the same `fan-sweep-progress` events, keyed by rpmChannel.
+ * Returns [rpmChannel, result] pairs.
+ */
+export const fanSweepAll = () =>
+  invoke<[number, SweepResult][]>("fan_sweep_all");
+
 /** Cancel an in-flight sweep (Stop button). Fan is handed back to the BIOS. */
 export const fanCancelSweep = () => invoke<void>("fan_cancel_sweep");
 
@@ -161,8 +174,8 @@ export interface FanControlPlan {
 
 /**
  * Install the background control plan. The backend's in-process loop then holds
- * every mapped fan to its target every couple of seconds — immune to webview
- * timer throttling when the window is hidden, unlike the old JS-driven loop.
+ * every mapped fan to its target every second — immune to webview timer
+ * throttling when the window is hidden, unlike the old JS-driven loop.
  */
 export const fanSetControlPlan = (plan: FanControlPlan) =>
   invoke<void>("fan_set_control_plan", { plan });

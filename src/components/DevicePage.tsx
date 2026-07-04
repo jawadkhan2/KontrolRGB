@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { useDevices } from "../store/devices";
-import type { Color, DeviceType, EffectKind } from "../types/device";
+import type { Color, DeviceType } from "../types/device";
+import { effectLabel } from "../lib/effectRegistry";
 import { BrightnessSlider } from "./effects/BrightnessSlider";
 import { ColorPickerPopover } from "./effects/ColorPickerPopover";
 import { EffectPanel } from "./effects/EffectPanel";
@@ -35,15 +36,6 @@ const TYPE_ICONS: Record<DeviceType, ReactNode> = {
   ),
 };
 
-const EFFECT_LABELS: Record<EffectKind, string> = {
-  static: "Static",
-  breathing: "Breathing",
-  rainbow_wave: "Rainbow Wave",
-  color_cycle: "Color Cycle",
-  custom: "Custom",
-  onboard: "Onboard",
-};
-
 /** Quick-pick paint colors (mirrors the redesign swatch row). */
 const PRESETS: Color[] = [
   { r: 34, g: 211, b: 238 },  // cyan
@@ -59,7 +51,7 @@ const hex2 = (n: number) => n.toString(16).padStart(2, "0");
 const toHex = (c: Color) => `#${hex2(c.r)}${hex2(c.g)}${hex2(c.b)}`.toUpperCase();
 const sameColor = (a: Color, b: Color) => a.r === b.r && a.g === b.g && a.b === b.b;
 
-export function DevicePage() {
+export function DevicePage({ onOpenLibrary }: { onOpenLibrary: (deviceId: string) => void }) {
   const device = useDevices((s) => s.devices.find((d) => d.id === s.selectedId));
   const state = useDevices((s) => (s.selectedId ? s.states[s.selectedId] : undefined));
   const applyEffect = useDevices((s) => s.applyEffect);
@@ -83,7 +75,7 @@ export function DevicePage() {
     <div className="card">
       <div className="card-head">
         <h3>Effect</h3>
-        <span className="chip"><span className="led" style={{ background: "var(--seg)" }} /> {EFFECT_LABELS[state.effect.kind]}</span>
+        <span className="chip"><span className="led" style={{ background: "var(--seg)" }} /> {effectLabel(state.effect.kind)}</span>
       </div>
       <div className="card-pad">
         <EffectPanel
@@ -91,6 +83,7 @@ export function DevicePage() {
           effects={device.supported_effects}
           value={state.effect}
           onApply={(effect) => applyEffect(device.id, effect)}
+          onBrowseLibrary={() => onOpenLibrary(device.id)}
         />
       </div>
     </div>

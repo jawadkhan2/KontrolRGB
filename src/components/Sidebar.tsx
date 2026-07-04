@@ -1,4 +1,5 @@
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import type { View } from "../App";
 import { useDevices } from "../store/devices";
 import { useFans, fansFullyControlled } from "../store/fans";
@@ -36,6 +37,24 @@ const TYPE_ACCENT: Record<DeviceType, string> = {
   motherboard: "var(--mb)",
   gpu: "var(--gpu)",
 };
+
+/* plain-English row labels; the exact model lives in the tooltip and the
+   device page header. "Case Fans" because the board's ARGB header is what
+   actually lights the fans. */
+const TYPE_LABEL: Record<DeviceType, string> = {
+  keyboard: "Keyboard",
+  motherboard: "Case Fans",
+  gpu: "GPU",
+};
+
+const LibraryIcon = (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+    <rect x="3" y="3" width="7.5" height="7.5" rx="1.6" />
+    <rect x="13.5" y="3" width="7.5" height="7.5" rx="1.6" />
+    <rect x="3" y="13.5" width="7.5" height="7.5" rx="1.6" />
+    <path d="M17.25 13.5v7.5M13.5 17.25H21" />
+  </svg>
+);
 
 const SyncIcon = (
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -80,9 +99,11 @@ function LiveSwatch({ device }: { device: DeviceInfo }) {
 export function Sidebar({
   view,
   onChangeView,
+  onOpenLibrary,
 }: {
   view: View;
   onChangeView: (v: View) => void;
+  onOpenLibrary: () => void;
 }) {
   const devices = useDevices((s) => s.devices);
   const selectedId = useDevices((s) => s.selectedId);
@@ -90,44 +111,57 @@ export function Sidebar({
   // Green only when every controllable fan (pump excluded) is on the app, not the
   // BIOS. Any fan still under BIOS control → dim dot.
   const fansControlled = useFans(fansFullyControlled);
+  const [version, setVersion] = useState("");
+  useEffect(() => {
+    getVersion().then(setVersion).catch(() => {});
+  }, []);
 
   return (
     <aside className="sidebar">
-      {/* status strip — brand lives in the titlebar, this is glanceable state */}
+      {/* hero card — the sync action and glanceable system status share one surface */}
       <div className="head">
-        <div className="sb-status">
-          <span className="online" />
-          <div>
-            <div className="s-title">All systems synced</div>
-            <div className="s-sub">{devices.length} lighting · case fans</div>
-          </div>
-          <button
-            className={`gear ${view === "settings" ? "active" : ""}`}
-            onClick={() => onChangeView("settings")}
-            title="Settings"
-            aria-label="Settings"
-          >
-            {GearIcon}
-          </button>
-        </div>
+        <button
+          className={`sync-card ${view === "sync" ? "active" : ""}`}
+          onClick={() => onChangeView("sync")}
+        >
+          <span className="sync-main">
+            <span className="ico" style={{ ["--ac" as string]: "var(--accent)" }}>{SyncIcon}</span>
+            <span className="meta">
+              <span className="name">Sync All</span>
+              <span className="sub">One effect, every device</span>
+            </span>
+          </span>
+          <span className="sync-status">
+            <span className="online" />
+            <span className="line">
+              <b>All synced</b>
+              <span className="sep">·</span>
+              {devices.length} lighting
+              <span className="sep">·</span>
+              case fans
+            </span>
+          </span>
+        </button>
       </div>
 
       <nav className="nav">
         <button
-          onClick={() => onChangeView("sync")}
-          className={`nav-item sync-item ${view === "sync" ? "active" : ""}`}
+          onClick={onOpenLibrary}
+          className={`nav-item ${view === "library" ? "active" : ""}`}
           style={{ ["--ac" as string]: "var(--accent)" }}
         >
-          <span className="ico">{SyncIcon}</span>
+          <span className="ico">{LibraryIcon}</span>
           <span className="meta">
-            <span className="name">Sync All</span>
-            <span className="sub">One effect, every device</span>
+            <span className="name">Effects Library</span>
+            <span className="sub">Browse every effect</span>
           </span>
-          <span className="dot" />
         </button>
       </nav>
 
-      <div className="sec-label">Lighting</div>
+      <div className="sec-label">
+        <span>Lighting</span>
+        <span className="count">{devices.length}</span>
+      </div>
       <nav className="nav">
         {devices.map((d) => {
           const active = d.id === selectedId && view === "devices";
@@ -140,10 +174,11 @@ export function Sidebar({
               }}
               className={`nav-item ${active ? "active" : ""}`}
               style={{ ["--ac" as string]: TYPE_ACCENT[d.device_type] }}
+              title={d.name}
             >
               <span className="ico">{TYPE_ICONS[d.device_type]}</span>
               <span className="meta">
-                <span className="name">{d.name}</span>
+                <span className="name">{TYPE_LABEL[d.device_type]}</span>
                 <LiveSwatch device={d} />
               </span>
               <span className="dot" />
@@ -152,7 +187,9 @@ export function Sidebar({
         })}
       </nav>
 
-      <div className="sec-label">Cooling</div>
+      <div className="sec-label">
+        <span>Cooling</span>
+      </div>
       <nav className="nav">
         <button
           onClick={() => onChangeView("fans")}
@@ -170,10 +207,17 @@ export function Sidebar({
       </nav>
 
       <div className="foot">
-        <button className="btn-global" onClick={() => onChangeView("sync")}>
-          {SyncIcon}
-          Sync all devices
+        <button
+          className={`nav-item ${view === "settings" ? "active" : ""}`}
+          onClick={() => onChangeView("settings")}
+          style={{ ["--ac" as string]: "var(--dim)" }}
+        >
+          <span className="ico gear-rot">{GearIcon}</span>
+          <span className="meta">
+            <span className="name">Settings</span>
+          </span>
         </button>
+        {version && <span className="ver">v{version}</span>}
       </div>
     </aside>
   );
