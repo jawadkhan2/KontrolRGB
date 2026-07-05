@@ -505,6 +505,7 @@ impl Nct6687 {
                 self.lpc.outb(self.base + EC_PAGE, EC_PAGE_SELECT);
                 break;
             }
+            std::hint::spin_loop();
         }
 
         self.lpc.outb(self.base + EC_PAGE, page);
@@ -524,6 +525,10 @@ impl Nct6687 {
     /// Read every channel: RPM for all 16, PWM-out + manual flag for the 8
     /// controllable headers. Pure read — never mutates fan state.
     pub fn read_all(&self) -> Result<Vec<ChannelReading>, ChipError> {
+        // Hold the ISA bus once for the whole snapshot so the ~40 per-byte EC
+        // reads below don't thrash the (recursive) lock; the inner per-access
+        // locks nest harmlessly.
+        let _isa = self.lpc.isa_lock();
         let mut out = Vec::with_capacity(FAN_RPM_REG.len());
         for (i, &reg) in FAN_RPM_REG.iter().enumerate() {
             // 16-channel tach dump for monitoring (the index is the tach position
@@ -555,6 +560,8 @@ impl Nct6687 {
     /// Read all temperature sensors. Returns only sensors with plausible values
     /// (1..=110 °C); unconnected or invalid sensors are silently omitted.
     pub fn read_temps(&self) -> Result<Vec<TempReading>, ChipError> {
+        // One bus lock for the whole sensor sweep (recursive with per-access locks).
+        let _isa = self.lpc.isa_lock();
         let mut out = Vec::new();
         for &(addr, key, label) in TEMP_REGS {
             // 16-bit: hi byte = signed °C, bit 7 of lo byte = 0.5° fraction.
@@ -594,6 +601,7 @@ impl Nct6687 {
                 self.lpc.outb(self.base + EC_PAGE, EC_PAGE_SELECT);
                 break;
             }
+            std::hint::spin_loop();
         }
         self.lpc.outb(self.base + EC_PAGE, page);
         self.lpc.outb(self.base + EC_INDEX, index);
@@ -649,7 +657,6 @@ impl Nct6687 {
         let mode = self.ec_read(ctl.mode_reg)?;
         let mode_bit = mode & (1 << ctl.mode_bit);
         let duty = self.ec_read(ctl.cmd)?;
-        eprintln!("[fan restore] saved header{index} mode_bit={mode_bit} duty={duty}");
         self.saved.lock()[index] = Some(SavedFan { mode_bit, duty });
         Ok(())
     }
@@ -677,7 +684,6 @@ impl Nct6687 {
         // bit alone does NOT release on Z890 — the change must be committed.
         self.commit_duty(index, saved.duty)?;
         self.saved.lock()[index] = None;
-        eprintln!("[fan restore] released header{index}, duty restored");
         Ok(())
     }
 
@@ -786,8 +792,7 @@ impl Nct6687 {
     /// `0xA00`, SYS in `0x80F`), then write the duty through the config handshake
     /// (`commit_duty`). The set bit makes the EC follow the single-byte command
     /// register directly, bypassing the SmartFAN curve engine and its ~2%/sec
-    /// smoothing — which was the 20-30s SYS-fan ramp. Logs a duty readback + tach
-    /// RPM so a manual test is conclusive.
+    /// smoothing — which was the 20-30s SYS-fan ramp.
     pub fn set_manual_pwm(&self, index: usize, duty: u8) -> Result<(), ChipError> {
         let ctl = FAN_CTL.get(index).ok_or(ChipError::EcUnresponsive(0))?;
         // Hold the ISA bus across mode-bit set + commit so the manual-bit write and
@@ -803,11 +808,6 @@ impl Nct6687 {
         let mode = self.ec_read(ctl.mode_reg)?;
         self.ec_write(ctl.mode_reg, mode | (1 << ctl.mode_bit))?;
         self.commit_duty(index, duty)?;
-        let readback = self.ec_read(ctl.pwm_read).unwrap_or(0);
-        let rpm = decode_rpm(self.ec_read_u16(ctl.rpm).unwrap_or(0));
-        eprintln!(
-            "[fan set] header{index} cmd={duty} committed=true readback={readback} rpm={rpm}"
-        );
         Ok(())
     }
 

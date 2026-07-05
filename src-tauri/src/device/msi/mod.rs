@@ -182,33 +182,6 @@ pub fn probe() -> Result<Option<MsiDevice>, DeviceError> {
     }))
 }
 
-/// Rolling write-health counters, flushed to stderr once per window so we can
-/// see how often the board silently drops direct mode (re-arms) versus how
-/// often even the re-armed retry fails (hard failures, which trigger the
-/// visible 500ms stall). Temporary instrumentation for the "stuck then jump"
-/// fan-RGB report.
-#[derive(Default)]
-struct WriteStats {
-    frames: u32,
-    /// Frames where at least one header's first write failed but the re-arm
-    /// recovered it (today swallowed silently inside `write_header`).
-    frames_with_rearm: u32,
-    /// Total header re-arms across all frames in the window.
-    rearms: u32,
-    /// Frames where the re-armed retry also failed (worker hits the 500ms sleep).
-    hard_failures: u32,
-    /// Total wall time actually spent inside write_frame() this window. If this
-    /// approaches the window length, the worker is write-bound (device is the
-    /// ceiling). If it's far below while frames/s is low, the worker isn't being
-    /// scheduled (CPU starvation), not the HID write.
-    busy: Duration,
-    /// Slowest single write_frame() in the window.
-    max_write: Duration,
-}
-
-/// How long stats accumulate before a summary line is printed.
-const STATS_WINDOW: Duration = Duration::from_secs(5);
-
 /// Minimum spacing between frame writes (~20 fps). The engine produces ~30 fps;
 /// the MSI MCU drops feature reports when fed that fast (a dropped report blocks
 /// the SetFeature call for the full ~5s Windows HID timeout, freezing the fans).
@@ -219,8 +192,6 @@ const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(50);
 fn worker(ctl: MsiController, shared: Arc<Shared>) {
     let mut seen_generation = 0u64;
     let mut pending_retry = false;
-    let mut stats = WriteStats::default();
-    let mut window_start = std::time::Instant::now();
     let mut last_write = std::time::Instant::now();
 
     // Spawn the watchdog that aborts a HID write the MCU stalls on (~5s freeze).
@@ -263,48 +234,14 @@ fn worker(ctl: MsiController, shared: Arc<Shared>) {
             st.frame.clone()
         };
 
-        stats.frames += 1;
-        let write_start = std::time::Instant::now();
-        last_write = write_start;
-        let result = write_frame(&ctl, &guard, &frame);
-        let elapsed = write_start.elapsed();
-        stats.busy += elapsed;
-        stats.max_write = stats.max_write.max(elapsed);
-        match result {
-            Ok(rearms) => {
-                pending_retry = false;
-                if rearms > 0 {
-                    stats.frames_with_rearm += 1;
-                    stats.rearms += rearms;
-                }
-            }
+        last_write = std::time::Instant::now();
+        match write_frame(&ctl, &guard, &frame) {
+            Ok(_rearms) => pending_retry = false,
             Err(e) => {
                 pending_retry = true;
-                stats.hard_failures += 1;
                 eprintln!("msi: frame write failed: {e}");
                 thread::sleep(Duration::from_millis(500));
             }
-        }
-
-        if window_start.elapsed() >= STATS_WINDOW {
-            let secs = window_start.elapsed().as_secs_f32();
-            eprintln!(
-                "msi-writer health [{:.1}s]: {} frames ({:.1}/s), {} frames re-armed, \
-                 {} total re-arms, {} hard failures (500ms stalls), \
-                 busy {:.1}s ({:.0}%), avg write {:.0}ms, max write {:.0}ms",
-                secs,
-                stats.frames,
-                stats.frames as f32 / secs,
-                stats.frames_with_rearm,
-                stats.rearms,
-                stats.hard_failures,
-                stats.busy.as_secs_f32(),
-                stats.busy.as_secs_f32() / secs * 100.0,
-                stats.busy.as_secs_f32() * 1000.0 / stats.frames.max(1) as f32,
-                stats.max_write.as_secs_f32() * 1000.0,
-            );
-            stats = WriteStats::default();
-            window_start = std::time::Instant::now();
         }
     }
 }

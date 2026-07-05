@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type { View } from "../App";
 import { useDevices } from "../store/devices";
@@ -6,9 +6,12 @@ import { useSettings, type SyncEffectId } from "../store/settings";
 import type { Color, DeviceInfo, DeviceType } from "../types/device";
 import {
   EFFECTS,
+  EFFECT_BY_KIND,
+  isEffectKind,
   capabilityFor,
   configForDevice,
 } from "../lib/effectRegistry";
+import type { EffectKind } from "../types/device";
 import { ColorPickerPopover } from "./effects/ColorPickerPopover";
 
 /* line-style device icons (inherit currentColor → tinted by --ac) */
@@ -40,6 +43,14 @@ const TYPE_ACCENT: Record<DeviceType, string> = {
   keyboard: "var(--kb)",
   motherboard: "var(--mb)",
   gpu: "var(--gpu)",
+};
+
+/* plain-English tile labels; the exact model lives in the tooltip. "Case Fans"
+   because the board's ARGB header is what actually lights the fans. */
+const TYPE_LABEL: Record<DeviceType, string> = {
+  keyboard: "Keyboard",
+  motherboard: "Case Fans",
+  gpu: "GPU",
 };
 
 const CHECK = (
@@ -97,7 +108,37 @@ export function SyncPage({ onChangeView }: { onChangeView: (v: View) => void }) 
   const excluded = useSettings((s) => s.syncExcluded);
   const setExcluded = useSettings((s) => s.setSyncExcluded);
 
-  const effect = SYNC_EFFECTS.find((e) => e.kind === effectId)!;
+  // Fall back to the first sync effect if a stale/unknown id was persisted
+  // (an older build, or an effect that later became non-browsable) — otherwise
+  // dereferencing an undefined match below would white-screen the whole page.
+  const effect = SYNC_EFFECTS.find((e) => e.kind === effectId) ?? SYNC_EFFECTS[0];
+
+  // Effect picker dropdown — mirrors the per-device EffectPanel dropdown:
+  // starred favorites first, then the rest, then a Browse Effects Library footer.
+  const favorites = useSettings((s) => s.favoriteEffects);
+  const syncKinds = SYNC_EFFECTS.map((e) => e.kind);
+  const favs = favorites.filter(
+    (k): k is EffectKind => isEffectKind(k) && syncKinds.includes(k),
+  );
+  const rest = syncKinds.filter((k) => !favs.includes(k));
+
+  const [open, setOpen] = useState(false);
+  const ddRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (ddRef.current && !ddRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
 
   const isIncluded = (id: string) => !excluded[id];
 
@@ -218,12 +259,12 @@ export function SyncPage({ onChangeView }: { onChangeView: (v: View) => void }) 
                 style={{ ["--ac" as string]: TYPE_ACCENT[device.device_type] }}
                 onClick={() => setExcluded({ ...excluded, [device.id]: included })}
                 disabled={cap === "none"}
-                title={cap === "none" ? "This device can't run the selected effect" : undefined}
+                title={cap === "none" ? `${device.name} can't run the selected effect` : device.name}
               >
                 <span className="check">{CHECK}</span>
                 <span className="ico">{TYPE_ICONS[device.device_type]}</span>
                 <span className="meta">
-                  <span className="nm">{device.name}</span>
+                  <span className="nm">{TYPE_LABEL[device.device_type]}</span>
                   <span className="sub">{deviceSub(device)}</span>
                 </span>
                 {badge && <span className="badge">{badge}</span>}
@@ -240,17 +281,63 @@ export function SyncPage({ onChangeView }: { onChangeView: (v: View) => void }) 
               <span className="chip"><span className="led" style={{ background: "var(--seg)" }} /> {effect.label}</span>
             </div>
             <div className="card-pad">
-              <div className="effect-grid">
-                {SYNC_EFFECTS.map((e) => (
-                  <button
-                    key={e.kind}
-                    className={`fx ${e.kind === effectId ? "on" : ""}`}
-                    onClick={() => setEffectId(e.kind as SyncEffectId)}
-                  >
-                    <div className={`pv ${e.pv}`} />
-                    <div className="nm">{e.label}</div>
-                  </button>
-                ))}
+              <div className="fx-dd" ref={ddRef}>
+                <button
+                  className={`fx-dd-btn ${open ? "open" : ""}`}
+                  onClick={() => setOpen((o) => !o)}
+                  aria-haspopup="listbox"
+                  aria-expanded={open}
+                >
+                  <span className={`pv ${effect.pv}`} />
+                  <span className="meta">
+                    <span className="nm">{effect.label}</span>
+                    <span className="ds">{effect.description}</span>
+                  </span>
+                  <svg className="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="m6 9 6 6 6-6" />
+                  </svg>
+                </button>
+
+                {open && (
+                  <div className="fx-dd-menu" role="listbox">
+                    {[...favs, ...rest].map((kind) => (
+                      <button
+                        key={kind}
+                        role="option"
+                        aria-selected={kind === effectId}
+                        className={`fx-dd-item ${kind === effectId ? "on" : ""}`}
+                        onClick={() => { setEffectId(kind as SyncEffectId); setOpen(false); }}
+                      >
+                        <span className={`pv ${EFFECT_BY_KIND[kind].pv}`} />
+                        <span className="nm">{EFFECT_BY_KIND[kind].label}</span>
+                        {favs.includes(kind) && (
+                          <svg className="fav" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M12 2.5 14.9 8.6l6.6.8-4.9 4.5 1.3 6.5-5.9-3.3-5.9 3.3 1.3-6.5L2.5 9.4l6.6-.8z" />
+                          </svg>
+                        )}
+                        {kind === effectId && (
+                          <svg className="chk" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="m5 12.5 4.5 4.5L19 7.5" />
+                          </svg>
+                        )}
+                      </button>
+                    ))}
+
+                    <div className="fx-dd-sep" />
+                    <button
+                      className="fx-dd-item browse"
+                      onClick={() => { setOpen(false); onChangeView("library"); }}
+                    >
+                      <span className="pv pv-dd-browse">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
+                          <circle cx="11" cy="11" r="7" />
+                          <path d="m20 20-3.5-3.5" />
+                        </svg>
+                      </span>
+                      <span className="nm">Browse Effects Library…</span>
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
           </div>

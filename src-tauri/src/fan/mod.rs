@@ -1010,14 +1010,43 @@ impl FanSubsystem {
         #[cfg(windows)]
         {
             let need_start;
+            let need_watchdog;
             {
                 let mut inner = self.inner.lock();
+                // Pre-sort every curve's points once, here, so the per-second
+                // control pass can interpolate without re-sorting/allocating.
+                let mut plan = plan;
+                for mode in plan.modes.values_mut() {
+                    if let FanControlMode::Curve { points, .. } = mode {
+                        points.sort_by(|a, b| {
+                            a.temp_c
+                                .partial_cmp(&b.temp_c)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    }
+                }
+                if let Some(FanControlMode::Curve { points, .. }) = plan.default_mode.as_mut() {
+                    points.sort_by(|a, b| {
+                        a.temp_c
+                            .partial_cmp(&b.temp_c)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
                 inner.control_plan = Some(plan);
                 // Force a re-apply on the next pass; the config just changed.
                 inner.control_last_commanded.clear();
                 need_start = !inner.control_started;
                 if need_start {
                     inner.control_started = true;
+                }
+                // The control loop is now the fans' sole heartbeat source, so its
+                // failsafe MUST be armed here — not only on the manual `set_speed`
+                // path. A curve-only session that never touched a slider would
+                // otherwise run with no watchdog: if the control thread died while
+                // holding a fan low, nothing would hand it back to the BIOS.
+                need_watchdog = !inner.watchdog_started;
+                if need_watchdog {
+                    inner.watchdog_started = true;
                 }
             }
             if need_start {
@@ -1027,6 +1056,9 @@ impl FanSubsystem {
                     self.conflicts_cleared.clone(),
                     self.gpu_telemetry.clone(),
                 );
+            }
+            if need_watchdog {
+                start_watchdog(self.inner.clone());
             }
         }
     }
@@ -1072,11 +1104,13 @@ impl FanSubsystem {
                 if header == PUMP_HEADER_INDEX {
                     continue;
                 }
-                held = true;
                 let Some(mode) = plan.modes.get(&rpm_channel).or(plan.default_mode.as_ref())
                 else {
+                    // Mapped but no mode/default → left on the BIOS. Do NOT flag
+                    // the session as manually held for a fan we never command.
                     continue;
                 };
+                held = true;
                 let raw = match mode {
                     FanControlMode::Manual { pct } => *pct,
                     FanControlMode::Curve {
@@ -1151,29 +1185,27 @@ impl FanSubsystem {
 
 /// Linear interpolation of a fan curve at `temp_c`, clamped to the endpoints.
 /// Mirrors the frontend's `interpolateCurve` so previews match what we command.
+/// `points` MUST be pre-sorted by `temp_c` ascending (done once in
+/// `set_control_plan`), so this hot path allocates nothing and never re-sorts.
 #[cfg(windows)]
 fn interpolate_curve(points: &[CurvePoint], temp_c: f32) -> f32 {
-    if points.is_empty() {
+    let (Some(first), Some(last)) = (points.first(), points.last()) else {
         return 50.0;
-    }
-    let mut pts: Vec<&CurvePoint> = points.iter().collect();
-    pts.sort_by(|a, b| {
-        a.temp_c
-            .partial_cmp(&b.temp_c)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let first = pts[0];
-    let last = pts[pts.len() - 1];
+    };
     if temp_c <= first.temp_c {
         return first.speed_pct;
     }
     if temp_c >= last.temp_c {
         return last.speed_pct;
     }
-    for w in pts.windows(2) {
-        let (a, b) = (w[0], w[1]);
+    for w in points.windows(2) {
+        let (a, b) = (&w[0], &w[1]);
         if temp_c >= a.temp_c && temp_c <= b.temp_c {
-            let t = (temp_c - a.temp_c) / (b.temp_c - a.temp_c);
+            let span = b.temp_c - a.temp_c;
+            if span <= 0.0 {
+                return a.speed_pct;
+            }
+            let t = (temp_c - a.temp_c) / span;
             return a.speed_pct + t * (b.speed_pct - a.speed_pct);
         }
     }

@@ -128,7 +128,6 @@ export function Sidebar({
             <span className="ico" style={{ ["--ac" as string]: "var(--accent)" }}>{SyncIcon}</span>
             <span className="meta">
               <span className="name">Sync All</span>
-              <span className="sub">One effect, every device</span>
             </span>
           </span>
           <span className="sync-status">

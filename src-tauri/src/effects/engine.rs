@@ -43,19 +43,9 @@ pub async fn run(app: AppHandle, state: Arc<AppState>) {
     let mut seen_device_generation = state.device_generation.load(Ordering::Relaxed);
     let mut tick: u64 = 0;
 
-    // Temporary instrumentation for the "stuck then jump" fan-RGB report. Counts,
-    // per 5s window: ticks actually fired (vs the ideal ~150), zone frames written
-    // to hardware, and zone frames skipped as unchanged (8-bit dedup). Separates
-    // "engine tick starved" (low ticks) from "frame dedup" (high skips, low writes).
-    let mut dbg_window = Instant::now();
-    let mut dbg_ticks: u64 = 0;
-    let mut dbg_writes: u64 = 0;
-    let mut dbg_skips: u64 = 0;
-
     loop {
         interval.tick().await;
         tick += 1;
-        dbg_ticks += 1;
         let t = start.elapsed().as_secs_f32();
         let emit_this_tick = tick.is_multiple_of(2);
         let mut payloads: Vec<FramePayload> = Vec::new();
@@ -156,9 +146,6 @@ pub async fn run(app: AppHandle, state: Arc<AppState>) {
                         }
                         device_last.insert(zone.id.clone(), frame.clone());
                         any_changed = true;
-                        dbg_writes += 1;
-                    } else if hw_enabled {
-                        dbg_skips += 1;
                     }
                     if emit_this_tick {
                         payload_zones.insert(zone.id.clone(), frame);
@@ -182,23 +169,6 @@ pub async fn run(app: AppHandle, state: Arc<AppState>) {
 
         for payload in payloads {
             let _ = app.emit("device-frame", payload);
-        }
-
-        if dbg_window.elapsed() >= Duration::from_secs(5) {
-            let secs = dbg_window.elapsed().as_secs_f32();
-            eprintln!(
-                "engine health [{:.1}s]: {} ticks ({:.1}/s of ~30 ideal), \
-                 {} zone writes, {} zone skips (unchanged/dedup)",
-                secs,
-                dbg_ticks,
-                dbg_ticks as f32 / secs,
-                dbg_writes,
-                dbg_skips,
-            );
-            dbg_window = Instant::now();
-            dbg_ticks = 0;
-            dbg_writes = 0;
-            dbg_skips = 0;
         }
     }
 }
