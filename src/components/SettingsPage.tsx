@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
+import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { useSettings } from "../store/settings";
 import { useFans } from "../store/fans";
 import {
@@ -226,6 +227,41 @@ function UpdateRow() {
   );
 }
 
+/** Launch-on-boot toggle. The Windows Run-key registration is the source of
+ *  truth (not localStorage), so we read the live state from the autostart
+ *  plugin on mount and write straight back to it on toggle. */
+function StartupRow() {
+  const [enabled, setEnabled] = useState(false);
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    isEnabled()
+      .then(setEnabled)
+      .catch(() => {})
+      .finally(() => setReady(true));
+  }, []);
+
+  const onChange = async (v: boolean) => {
+    // Optimistic flip; revert if the registry write fails.
+    setEnabled(v);
+    try {
+      if (v) await enable();
+      else await disable();
+    } catch {
+      setEnabled(!v);
+    }
+  };
+
+  return (
+    <ToggleRow
+      title="Start with Windows"
+      description="Launch KontrolRGB automatically when you sign in, minimized to the system tray. Effects and fan control resume in the background without opening the window."
+      checked={ready && enabled}
+      onChange={(v) => void onChange(v)}
+    />
+  );
+}
+
 export function SettingsPage() {
   const fanControlOnStartup = useSettings((s) => s.fanControlOnStartup);
   const setFanControlOnStartup = useSettings((s) => s.setFanControlOnStartup);
@@ -255,6 +291,7 @@ export function SettingsPage() {
         </header>
 
         <SettingsSection title="Application">
+          <StartupRow />
           <ToggleRow
             title="Ask to run as administrator on startup"
             description="On launch, if KontrolRGB isn't already elevated, prompt for administrator rights (Windows UAC). Recommended — direct hardware paths like the ring-0 fan driver need admin. Decline the prompt and the app keeps running unprivileged."

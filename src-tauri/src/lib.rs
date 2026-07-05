@@ -26,6 +26,14 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        // Launch-on-boot. When the OS starts us from the Run key we pass
+        // `--minimized`; the window then stays hidden in the tray (see below).
+        // A manual launch has no such flag, so the window shows normally.
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .args(["--minimized"])
+                .build(),
+        )
         .manage(app_state.clone())
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -34,6 +42,15 @@ pub fn run() {
             tauri::async_runtime::spawn(persistence::run_saver(handle, app_state.clone()));
 
             build_tray(app.handle(), app_state.clone())?;
+
+            // The window is created hidden (visible: false in tauri.conf.json) so
+            // a boot launch never flashes on screen. Show it now unless we were
+            // started with --minimized (i.e. by the autostart Run entry), in
+            // which case the app lives in the tray until the user clicks it.
+            let launched_minimized = std::env::args().any(|a| a == "--minimized");
+            if !launched_minimized {
+                show_main_window(app.handle());
+            }
             Ok(())
         })
         .on_window_event(|window, event| {

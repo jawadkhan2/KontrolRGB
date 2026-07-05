@@ -1,6 +1,6 @@
 [package]
 name = "kontrolrgb"
-version = "0.2.2"
+version = "0.2.3"
 description = "Custom RGB controller for local hardware"
 authors = ["jawad"]
 edition = "2021"
@@ -23,6 +23,7 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-updater = "2"   # OTA updates via GitHub releases
 tauri-plugin-process = "2"   # restart() after an update is installed
+tauri-plugin-autostart = "2" # launch on boot (hidden to tray via --minimized)
 kontrolrgb-effects = { path = "../crates/kontrolrgb-effects" }  # shared with kontrolrgb-sim
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
