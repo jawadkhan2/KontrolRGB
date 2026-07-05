@@ -41,7 +41,13 @@ pub struct FanLimits {
     pub min_pwm: u8,
     /// Maximum PWM duty (%) — defaults to 100, user may cap for noise.
     pub max_pwm: u8,
-    /// Measured stall RPM from the sweep tester, if run. None = not yet measured.
+    /// True once the sweep tester has characterized this header. This — not a
+    /// sentinel RPM — is what lets the floor drop below `DEFAULT_MIN_PWM`.
+    #[serde(default)]
+    pub measured: bool,
+    /// Slowest RPM the fan still ran at during the sweep (the running speed just
+    /// above its stall point). `None` = not yet measured. Display/diagnostics
+    /// only; the floor logic keys off `measured`.
     pub measured_stall_rpm: Option<u16>,
     /// Measured top RPM from the sweep tester, if run.
     pub measured_max_rpm: Option<u16>,
@@ -52,6 +58,7 @@ impl Default for FanLimits {
         FanLimits {
             min_pwm: DEFAULT_MIN_PWM,
             max_pwm: 100,
+            measured: false,
             measured_stall_rpm: None,
             measured_max_rpm: None,
         }
@@ -71,11 +78,12 @@ impl FanLimits {
     /// below `DEFAULT_MIN_PWM` (the fan provably runs there); without one, the
     /// conservative default holds.
     pub fn effective_floor(&self) -> u8 {
-        match self.measured_stall_rpm {
-            // Stall was measured: trust the user-set/derived min_pwm as-is.
-            Some(_) => self.min_pwm,
+        if self.measured {
+            // Sweep characterized the fan: trust the derived min_pwm as-is.
+            self.min_pwm
+        } else {
             // No measurement yet: never go below the conservative default.
-            None => self.min_pwm.max(DEFAULT_MIN_PWM),
+            self.min_pwm.max(DEFAULT_MIN_PWM)
         }
     }
 
@@ -90,10 +98,10 @@ impl FanLimits {
             None => sweep.min_running_pct,
         };
         self.min_pwm = floor.min(self.max_pwm.min(100));
-        self.measured_stall_rpm = Some(match sweep.stall_pct {
-            Some(_) => 0,
-            None => sweep.min_running_rpm,
-        });
+        self.measured = true;
+        // Report the slowest RPM the fan still turned at (meaningful non-zero),
+        // whether or not it stalled within range — not a 0 sentinel.
+        self.measured_stall_rpm = Some(sweep.min_running_rpm);
         self.measured_max_rpm = Some(sweep.max_rpm);
     }
 }
@@ -110,10 +118,28 @@ mod tests {
     }
 
     #[test]
+    fn measured_flag_gates_sub_default_floor() {
+        let mut limits = FanLimits {
+            min_pwm: 20,
+            ..Default::default()
+        };
+        // Not characterized yet: the conservative default floor still holds even
+        // though min_pwm is lower.
+        assert_eq!(limits.effective_floor(), DEFAULT_MIN_PWM);
+        assert_eq!(limits.clamp_pct(0), DEFAULT_MIN_PWM);
+        // Once the sweep has characterized the fan, the lower measured floor is
+        // trusted — this is the only path allowed below DEFAULT_MIN_PWM.
+        limits.measured = true;
+        assert_eq!(limits.effective_floor(), 20);
+        assert_eq!(limits.clamp_pct(0), 20);
+    }
+
+    #[test]
     fn clamp_does_not_panic_when_max_is_below_floor() {
         let limits = FanLimits {
             min_pwm: 50,
             max_pwm: 30,
+            measured: false,
             measured_stall_rpm: None,
             measured_max_rpm: None,
         };

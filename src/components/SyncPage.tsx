@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 import type { View } from "../App";
 import { useDevices } from "../store/devices";
 import { useSettings, type SyncEffectId } from "../store/settings";
-import type { Color, DeviceInfo, DeviceType } from "../types/device";
+import type { Color, DeviceInfo, DeviceType, EffectConfig } from "../types/device";
 import {
   EFFECTS,
   EFFECT_BY_KIND,
@@ -142,6 +142,10 @@ export function SyncPage({ onChangeView }: { onChangeView: (v: View) => void }) 
 
   const isIncluded = (id: string) => !excluded[id];
 
+  // Snapshot of each included device's effect at the moment "Turn all off" was
+  // clicked, so the same button can restore it. null = lights on.
+  const [offSnapshot, setOffSnapshot] = useState<Record<string, EffectConfig> | null>(null);
+
   // Per-device live state under the current effect + include/fallback choices.
   const plan = useMemo(
     () =>
@@ -174,15 +178,29 @@ export function SyncPage({ onChangeView }: { onChangeView: (v: View) => void }) 
         });
         if (cfg) applyEffect(p.device.id, cfg);
       }
+      // Any live apply relights the devices, so an earlier "Turn all off"
+      // snapshot is stale — flip the button back to its off state.
+      setOffSnapshot(null);
     }, 80);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [plan, color, speed, reverse]);
 
   const turnAllOff = () => {
+    const snap: Record<string, EffectConfig> = {};
     for (const p of plan) {
-      if (p.included) applyEffect(p.device.id, { kind: "static", color: { r: 0, g: 0, b: 0 } });
+      if (!p.included) continue;
+      const current = states[p.device.id]?.effect;
+      if (current) snap[p.device.id] = current;
+      applyEffect(p.device.id, { kind: "static", color: { r: 0, g: 0, b: 0 } });
     }
+    setOffSnapshot(snap);
+  };
+
+  const turnAllOn = () => {
+    if (!offSnapshot) return;
+    for (const [id, effect] of Object.entries(offSnapshot)) applyEffect(id, effect);
+    setOffSnapshot(null);
   };
 
   // Master brightness reflects the brightest included device; applied live.
@@ -229,10 +247,14 @@ export function SyncPage({ onChangeView }: { onChangeView: (v: View) => void }) 
             </div>
             <button
               className="btn ghost"
-              onClick={turnAllOff}
-              title="Turn off every included device"
+              onClick={offSnapshot ? turnAllOn : turnAllOff}
+              title={
+                offSnapshot
+                  ? "Restore each device's previous effect"
+                  : "Turn off every included device"
+              }
             >
-              Turn all off
+              {offSnapshot ? "Turn all on" : "Turn all off"}
             </button>
           </div>
         </div>

@@ -96,6 +96,32 @@ impl GpuTelemetrySubsystem {
         }
     }
 
+    /// Die temperature only — the fan control loop's per-second hot path. Runs a
+    /// single NVML getter instead of the full five-query `read()` (which also
+    /// allocates a `String` for the card name every call), so a curve bound to
+    /// the GPU source costs one FFI call per pass. `None` when NVML is
+    /// unavailable or the metric can't be read.
+    pub fn read_temp_only(&self) -> Option<u32> {
+        #[cfg(windows)]
+        {
+            let nvml = {
+                let mut state = self.state.lock();
+                if matches!(*state, State::Uninit) {
+                    *state = Self::init();
+                }
+                match &*state {
+                    State::Ready(nvml) => nvml.clone(),
+                    _ => return None,
+                }
+            };
+            nvml.temp_c()
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
     #[cfg(windows)]
     fn init() -> State {
         match nvml::Nvml::load() {

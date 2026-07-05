@@ -5,6 +5,8 @@ mod effects;
 mod fan;
 mod gpu_telemetry;
 mod persistence;
+#[cfg(windows)]
+mod power_watch;
 mod process_guard;
 mod state;
 
@@ -38,8 +40,25 @@ pub fn run() {
         .setup(move |app| {
             let handle = app.handle().clone();
             persistence::load_and_apply(&handle, &app_state);
+            // Crash-recovery: if a prior unclean exit left the marker behind, the
+            // in-process watchdog never got to run, so reclaim any stranded mapped
+            // fan back to the BIOS now. Runs AFTER load_and_apply so the persisted
+            // pwm_map is known.
+            if let Ok(dir) = handle.path().app_data_dir() {
+                app_state.fan.init_recovery(dir.join("fan_manual.lock"));
+            }
             tauri::async_runtime::spawn(effects::engine::run(handle.clone(), app_state.clone()));
             tauri::async_runtime::spawn(persistence::run_saver(handle, app_state.clone()));
+
+            // Monitor sleep / system suspend resets the USB RGB controllers
+            // (fans revert to firmware rainbow, HID handles go dead). Watch for
+            // wake events and re-probe the hardware automatically.
+            #[cfg(windows)]
+            {
+                let wake_handle = app.handle().clone();
+                let wake_state = app_state.clone();
+                power_watch::spawn(move || wake_recovery(&wake_handle, &wake_state));
+            }
 
             build_tray(app.handle(), app_state.clone())?;
 
@@ -137,6 +156,41 @@ fn build_tray(app: &tauri::AppHandle, state: Arc<AppState>) -> tauri::Result<()>
         .build(app)?;
 
     Ok(())
+}
+
+/// Wake-from-sleep recovery: re-probe all RGB hardware so dead HID handles are
+/// replaced and direct mode is re-armed; the engine's generation bump then
+/// re-pushes every device's configured effect. USB re-enumeration can lag the
+/// wake event — if a device that was real before the rescan comes back as a
+/// mock, wait and retry a few times before giving up.
+#[cfg(windows)]
+fn wake_recovery(app: &tauri::AppHandle, state: &Arc<AppState>) {
+    use std::collections::HashSet;
+
+    eprintln!("power-watch: wake detected, re-probing RGB hardware");
+    let real_before: HashSet<String> = state
+        .manager
+        .lock()
+        .infos()
+        .into_iter()
+        .map(|i| i.id)
+        .filter(|id| !id.starts_with("mock-"))
+        .collect();
+
+    for attempt in 1..=5 {
+        if attempt > 1 {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+        let after: HashSet<String> = commands::rescan_and_notify(app, state)
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        if real_before.iter().all(|id| after.contains(id)) {
+            return;
+        }
+        eprintln!("power-watch: not all devices re-enumerated yet (attempt {attempt}/5)");
+    }
+    eprintln!("power-watch: gave up waiting for missing devices; use Rescan to retry");
 }
 
 /// Show, unminimize, and focus the main window (used by the tray).

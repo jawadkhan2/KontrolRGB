@@ -141,11 +141,17 @@ pub async fn run(app: AppHandle, state: Arc<AppState>) {
 
                     let unchanged = device_last.get(&zone.id) == Some(&frame);
                     if !unchanged && hw_enabled {
-                        if let Err(e) = device.set_zone_leds(&zone.id, &frame) {
-                            eprintln!("set_zone_leds {}/{}: {e}", info.id, zone.id);
+                        // Cache only on success — a failed write must be retried
+                        // next tick, not remembered as if it reached the hardware.
+                        match device.set_zone_leds(&zone.id, &frame) {
+                            Ok(()) => {
+                                device_last.insert(zone.id.clone(), frame.clone());
+                                any_changed = true;
+                            }
+                            Err(e) => {
+                                eprintln!("set_zone_leds {}/{}: {e}", info.id, zone.id)
+                            }
                         }
-                        device_last.insert(zone.id.clone(), frame.clone());
-                        any_changed = true;
                     }
                     if emit_this_tick {
                         payload_zones.insert(zone.id.clone(), frame);
@@ -156,6 +162,9 @@ pub async fn run(app: AppHandle, state: Arc<AppState>) {
                 if any_changed {
                     if let Err(e) = device.apply() {
                         eprintln!("apply {}: {e}", info.id);
+                        // Forget this device's cached frames so the whole frame
+                        // is re-staged and re-applied next tick.
+                        last_frames.remove(&info.id);
                     }
                 }
                 if emit_this_tick {

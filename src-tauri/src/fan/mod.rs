@@ -63,6 +63,29 @@ const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(windows)]
 const CONTROL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Thermal failsafe. If ANY chip temperature source (or the GPU die) reaches
+/// this, the control loop abandons the user's curve/manual duty AND the noise
+/// ceiling and drives every fan it controls to 100% until the temperature
+/// recovers. A misconfigured flat curve, a low manual duty, or a `max_pwm`
+/// noise cap can otherwise hold fans low into a thermal event — the PWM floor
+/// only guards against *stall*, never against *overheat*. This is the airflow
+/// backstop that closes that gap.
+#[cfg(windows)]
+const EMERGENCY_TEMP_C: f32 = 90.0;
+
+/// Once the emergency has engaged, keep forcing 100% until every temperature
+/// has dropped this far below the trip point, so a reading hovering right at
+/// the threshold can't flap the fans on and off.
+#[cfg(windows)]
+const EMERGENCY_CLEAR_C: f32 = 85.0;
+
+/// Curve-tracking hysteresis (°C). A curve fan only recomputes its target once
+/// the driving temperature has moved at least this far from the temperature at
+/// its last commanded change, so sensor jitter around a curve knee doesn't make
+/// the fan hunt up and down every second.
+#[cfg(windows)]
+const CURVE_HYSTERESIS_C: f32 = 1.5;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct FanConfig {
@@ -305,6 +328,24 @@ struct Inner {
     /// Last duty (%) the control loop commanded per tach channel (2% dedup).
     #[cfg(windows)]
     control_last_commanded: std::collections::HashMap<u8, u8>,
+    /// Driving temperature at each channel's last commanded change (curve
+    /// hysteresis): a curve fan holds until its source moves `CURVE_HYSTERESIS_C`
+    /// from this, so jitter around a knee can't make it hunt.
+    #[cfg(windows)]
+    control_last_temp: std::collections::HashMap<u8, f32>,
+    /// True while the thermal failsafe is forcing fans to 100%. Kept so the loop
+    /// applies the clear-hysteresis band and logs the engage/clear edges once.
+    #[cfg(windows)]
+    emergency_active: bool,
+    /// Crash-recovery marker file. Written while we hold manual control so the
+    /// next launch can detect an unclean exit that stranded a fan; removed on a
+    /// clean handoff back to the BIOS. `None` until wired at startup.
+    #[cfg(windows)]
+    recovery_marker: Option<std::path::PathBuf>,
+    /// Whether the marker file currently exists, so arming/disarming touches the
+    /// disk only on the actual transition, not every control pass.
+    #[cfg(windows)]
+    marker_armed: bool,
 }
 
 impl FanSubsystem {
@@ -333,6 +374,14 @@ impl FanSubsystem {
                 control_started: false,
                 #[cfg(windows)]
                 control_last_commanded: Default::default(),
+                #[cfg(windows)]
+                control_last_temp: Default::default(),
+                #[cfg(windows)]
+                emergency_active: false,
+                #[cfg(windows)]
+                recovery_marker: None,
+                #[cfg(windows)]
+                marker_armed: false,
             })),
             sweep_cancel: Arc::new(AtomicBool::new(false)),
             control_suspend: Arc::new(AtomicBool::new(false)),
@@ -347,6 +396,48 @@ impl FanSubsystem {
     pub fn cancel_sweep(&self) {
         self.sweep_cancel.store(true, Ordering::Relaxed);
     }
+
+    /// Wire the crash-recovery marker path (once, at startup) and reclaim any fan
+    /// a previous unclean exit may have stranded. If the marker file already
+    /// exists, the last session died holding manual control — an in-process
+    /// watchdog can't fire after a SIGKILL/power event — so force every persisted
+    /// mapped header back to the BIOS curve before the user touches anything.
+    /// Idempotent: no marker → nothing to do; chip unavailable → the marker is
+    /// kept so a later (elevated/driver-present) launch retries. Must run AFTER
+    /// the persisted config (the `pwm_map`) has been applied.
+    #[cfg(windows)]
+    pub fn init_recovery(&self, marker: std::path::PathBuf) {
+        let stranded = marker.exists();
+        let mut inner = self.inner.lock();
+        inner.recovery_marker = Some(marker);
+        if !stranded {
+            return;
+        }
+        // Reflect the on-disk file so a successful reclaim removes it.
+        inner.marker_armed = true;
+        Self::ensure_open(&mut inner);
+        let headers: Vec<u8> = inner
+            .pwm_map
+            .values()
+            .copied()
+            .filter(|&h| h != PUMP_HEADER_INDEX)
+            .collect();
+        if let Some(chip) = inner.chip.as_ref() {
+            for h in headers {
+                let _ = chip.force_release_header(h as usize);
+            }
+            eprintln!(
+                "[fan recovery] unclean exit detected — {} mapped header(s) forced back to BIOS",
+                inner.pwm_map.len()
+            );
+            disarm_marker(&mut inner);
+        } else {
+            eprintln!("[fan recovery] marker present but chip unavailable — will retry next launch");
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub fn init_recovery(&self, _marker: std::path::PathBuf) {}
 
     /// Ensure the chip is open. Non-fatal: a `None` chip just means "unavailable".
     #[cfg(windows)]
@@ -568,6 +659,7 @@ impl FanSubsystem {
             .ok_or_else(|| FanError::Unavailable(inner.detail.clone()))?;
         chip.release_to_bios()?;
         inner.manual_session_active = false;
+        disarm_marker(&mut inner);
         Ok(())
     }
 
@@ -711,6 +803,7 @@ impl FanSubsystem {
             }
             inner.manual_session_active = true;
             inner.last_heartbeat = Instant::now();
+            arm_marker(&mut inner);
         }
 
         // Phase 2 — hold the burst for the fixed window, sampling RPM so the modal
@@ -777,6 +870,7 @@ impl FanSubsystem {
             let _ = chip.release_to_bios();
         }
         inner.manual_session_active = false;
+        disarm_marker(&mut inner);
         if let Some(e) = read_err {
             return Err(e);
         }
@@ -860,6 +954,7 @@ impl FanSubsystem {
 
             inner.manual_session_active = true;
             inner.last_heartbeat = Instant::now();
+            arm_marker(&mut inner);
             need_watchdog = !inner.watchdog_started;
             if need_watchdog {
                 inner.watchdog_started = true;
@@ -987,10 +1082,13 @@ impl FanSubsystem {
         ))
     }
 
-    /// UI heartbeat: keep the watchdog from releasing control. The Fan page
-    /// calls this every poll while it holds any manual fan. Uses `try_lock` so
-    /// it never blocks behind a long hardware op (a missed beat or two is fine —
-    /// the watchdog timeout is several poll intervals wide).
+    /// UI heartbeat for the manual `set_speed` path. When a fan is held by a
+    /// direct slider write (no control *plan* pushed), the background control
+    /// loop isn't the heartbeat source — this poll is — so it is NOT vestigial:
+    /// it's what keeps the watchdog from reclaiming a slider-held fan between
+    /// writes. Curve/plan sessions beat from `control_pass` instead. Uses
+    /// `try_lock` so it never blocks behind a long hardware op (a missed beat or
+    /// two is fine — the watchdog timeout is several poll intervals wide).
     #[cfg(windows)]
     pub fn heartbeat(&self) {
         if let Some(mut inner) = self.inner.try_lock() {
@@ -1035,6 +1133,7 @@ impl FanSubsystem {
                 inner.control_plan = Some(plan);
                 // Force a re-apply on the next pass; the config just changed.
                 inner.control_last_commanded.clear();
+                inner.control_last_temp.clear();
                 need_start = !inner.control_started;
                 if need_start {
                     inner.control_started = true;
@@ -1070,47 +1169,93 @@ impl FanSubsystem {
     #[cfg(windows)]
     fn control_pass(inner_arc: &Arc<Mutex<Inner>>, gpu: &Arc<GpuTelemetrySubsystem>) {
         let mut inner = inner_arc.lock();
-        let Some(plan) = inner.control_plan.clone() else {
-            return;
-        };
-        if plan.released {
-            return;
+        // Bail if released or no plan — without cloning the plan every pass.
+        match inner.control_plan.as_ref() {
+            None => return,
+            Some(p) if p.released => return,
+            Some(_) => {}
         }
         Self::ensure_open(&mut inner);
 
-        // Read GPU die temp before taking the chip borrow, so a curve bound to the
-        // "gpu" source tracks the card. Cheap NVML query; unavailable → no "gpu"
-        // reading, and such a curve simply holds (matches a missing chip sensor).
-        let gpu_temp = gpu.read().temp_c;
+        // Die temp only — one NVML getter, not the full 5-query snapshot — so a
+        // "gpu"-sourced curve tracks the card at minimal per-pass cost.
+        // Unavailable → no "gpu" reading, and such a curve simply holds.
+        let gpu_temp = gpu.read_temp_only();
 
-        let mut commanded = inner.control_last_commanded.clone();
-        let mut held = false;
-        {
-            let Some(chip) = inner.chip.as_ref() else {
-                return;
-            };
-            let mut temps = match chip.read_temps() {
-                Ok(t) => t,
-                Err(_) => return,
-            };
-            if let Some(t) = gpu_temp {
-                temps.push(TempReading {
-                    key: "gpu".to_string(),
-                    label: "GPU".to_string(),
-                    temp_c: t as f32,
-                });
+        // Split disjoint field borrows so neither the plan nor the last-commanded
+        // map is cloned each pass.
+        let Inner {
+            chip,
+            pwm_map,
+            limits,
+            control_plan,
+            control_last_commanded,
+            control_last_temp,
+            emergency_active,
+            recovery_marker,
+            marker_armed,
+            manual_session_active,
+            last_heartbeat,
+            ..
+        } = &mut *inner;
+
+        let Some(plan) = control_plan.as_ref() else {
+            return;
+        };
+        let Some(chip) = chip.as_ref() else {
+            return;
+        };
+        let mut temps = match chip.read_temps() {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        if let Some(t) = gpu_temp {
+            temps.push(TempReading {
+                key: "gpu".to_string(),
+                label: "GPU".to_string(),
+                temp_c: t as f32,
+            });
+        }
+
+        // Thermal failsafe. Trip when the hottest source reaches
+        // EMERGENCY_TEMP_C; hold until everything drops below EMERGENCY_CLEAR_C
+        // so a reading sitting on the threshold can't flap the fans. While
+        // engaged, every controlled fan is forced to 100%, overriding both the
+        // user's curve/manual duty and any max_pwm noise cap.
+        let hottest = temps.iter().map(|r| r.temp_c).fold(f32::MIN, f32::max);
+        let emergency = if *emergency_active {
+            hottest >= EMERGENCY_CLEAR_C
+        } else {
+            hottest >= EMERGENCY_TEMP_C
+        };
+        if emergency != *emergency_active {
+            if emergency {
+                eprintln!(
+                    "[fan] THERMAL FAILSAFE engaged at {hottest:.1}°C — forcing controlled fans to 100%"
+                );
+            } else {
+                eprintln!(
+                    "[fan] thermal failsafe cleared ({hottest:.1}°C) — resuming curve/manual control"
+                );
             }
-            for (&rpm_channel, &header) in inner.pwm_map.iter() {
-                if header == PUMP_HEADER_INDEX {
-                    continue;
-                }
-                let Some(mode) = plan.modes.get(&rpm_channel).or(plan.default_mode.as_ref())
-                else {
-                    // Mapped but no mode/default → left on the BIOS. Do NOT flag
-                    // the session as manually held for a fan we never command.
-                    continue;
-                };
-                held = true;
+            *emergency_active = emergency;
+        }
+
+        let mut held = false;
+        for (&rpm_channel, &header) in pwm_map.iter() {
+            if header == PUMP_HEADER_INDEX {
+                continue;
+            }
+            let Some(mode) = plan.modes.get(&rpm_channel).or(plan.default_mode.as_ref()) else {
+                // Mapped but no mode/default → left on the BIOS. Do NOT flag the
+                // session as manually held for a fan we never command.
+                continue;
+            };
+            held = true;
+
+            let clamped = if emergency {
+                100
+            } else {
                 let raw = match mode {
                     FanControlMode::Manual { pct } => *pct,
                     FanControlMode::Curve {
@@ -1120,27 +1265,57 @@ impl FanSubsystem {
                         let Some(tr) = temps.iter().find(|r| r.key == *temp_source) else {
                             continue;
                         };
+                        // Hysteresis: hold the current target unless the source
+                        // has moved past the band since this fan last changed.
+                        if control_last_commanded.contains_key(&rpm_channel) {
+                            if let Some(&last_t) = control_last_temp.get(&rpm_channel) {
+                                if (tr.temp_c - last_t).abs() < CURVE_HYSTERESIS_C {
+                                    continue;
+                                }
+                            }
+                        }
                         interpolate_curve(points, tr.temp_c)
                     }
                 };
-                let limits = inner.limits.get(&header).cloned().unwrap_or_default();
-                let clamped = limits.clamp_pct(raw.round().clamp(0.0, 100.0) as u8);
-                let changed = commanded
-                    .get(&rpm_channel)
-                    .is_none_or(|&l| (clamped as i32 - l as i32).abs() > 2);
-                if changed {
-                    let duty = ((clamped as u16 * 255) / 100) as u8;
-                    if chip.set_manual_pwm(header as usize, duty).is_ok() {
-                        commanded.insert(rpm_channel, clamped);
+                let limits_h = limits.get(&header).cloned().unwrap_or_default();
+                limits_h.clamp_pct(raw.round().clamp(0.0, 100.0) as u8)
+            };
+
+            let changed = control_last_commanded
+                .get(&rpm_channel)
+                .is_none_or(|&l| (clamped as i32 - l as i32).abs() > 2);
+            if changed {
+                let duty = ((clamped as u16 * 255) / 100) as u8;
+                if chip.set_manual_pwm(header as usize, duty).is_ok() {
+                    control_last_commanded.insert(rpm_channel, clamped);
+                    // Record the driving temp at this change for the next
+                    // hysteresis comparison (curve fans only, non-emergency).
+                    if !emergency {
+                        if let FanControlMode::Curve { temp_source, .. } = mode {
+                            if let Some(tr) = temps.iter().find(|r| r.key == *temp_source) {
+                                control_last_temp.insert(rpm_channel, tr.temp_c);
+                            }
+                        }
                     }
                 }
             }
         }
 
-        inner.control_last_commanded = commanded;
         if held {
-            inner.manual_session_active = true;
-            inner.last_heartbeat = Instant::now();
+            *manual_session_active = true;
+            *last_heartbeat = Instant::now();
+            // Arm the crash-recovery marker (once). Inlined rather than calling
+            // arm_marker() because we hold disjoint field borrows here, not a
+            // whole &mut Inner.
+            if !*marker_armed {
+                if let Some(path) = recovery_marker.as_ref() {
+                    if let Some(dir) = path.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    let _ = std::fs::write(path, b"kontrolrgb held manual fan control\n");
+                }
+                *marker_armed = true;
+            }
         }
     }
 
@@ -1258,6 +1433,39 @@ impl Drop for SuspendGuard {
     }
 }
 
+/// Write the crash-recovery marker (once) the first time we take manual control
+/// in a session. Its presence at the next launch signals that this process may
+/// have died holding a fan, so the fresh instance force-releases the persisted
+/// mapped headers before doing anything else. Best-effort: a failed write only
+/// costs us the recovery hint, never correctness.
+#[cfg(windows)]
+fn arm_marker(inner: &mut Inner) {
+    if inner.marker_armed {
+        return;
+    }
+    if let Some(path) = &inner.recovery_marker {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, b"kontrolrgb held manual fan control\n");
+    }
+    inner.marker_armed = true;
+}
+
+/// Remove the crash-recovery marker on a clean handoff back to the BIOS (STOP,
+/// watchdog release, burst/sweep cleanup). A missing marker at next launch means
+/// we exited cleanly and left no fan stranded.
+#[cfg(windows)]
+fn disarm_marker(inner: &mut Inner) {
+    if !inner.marker_armed {
+        return;
+    }
+    if let Some(path) = &inner.recovery_marker {
+        let _ = std::fs::remove_file(path);
+    }
+    inner.marker_armed = false;
+}
+
 /// Background guard: if the control loop stops refreshing the heartbeat while we
 /// hold manual control, hand the fans back to the BIOS so a crashed/frozen UI or
 /// a hung controller can never strand a fan at a fixed (possibly low) duty.
@@ -1277,6 +1485,7 @@ fn start_watchdog(inner: Arc<Mutex<Inner>>) {
             let _ = chip.release_to_bios();
         }
         guard.manual_session_active = false;
+        disarm_marker(&mut guard);
     });
 }
 

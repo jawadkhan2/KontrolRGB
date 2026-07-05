@@ -50,5 +50,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
     "Win32_Devices_HumanInterfaceDevice",
     "Win32_UI_Shell",                       # ShellExecuteW "runas" elevation
+    "Win32_UI_WindowsAndMessaging",         # hidden window for WM_POWERBROADCAST
+    "Win32_System_Power",                   # RegisterPowerSettingNotification
+    "Win32_System_SystemServices",          # GUID_CONSOLE_DISPLAY_STATE
+    "Win32_System_LibraryLoader",           # GetModuleHandleW
 ] }
 

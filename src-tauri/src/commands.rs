@@ -223,10 +223,18 @@ pub fn apply_to_all(
 
 #[tauri::command]
 pub fn rescan_devices(app: AppHandle, state: State<'_, Arc<AppState>>) -> Vec<DeviceInfo> {
+    rescan_and_notify(&app, &state)
+}
+
+/// Re-detect hardware, bump the engine's device generation (so it drops cached
+/// frames belonging to the old handles), re-seed runtime state, and push the
+/// refreshed device list to the frontend. Shared by the rescan command and the
+/// wake-from-sleep recovery path.
+pub fn rescan_and_notify(app: &AppHandle, state: &AppState) -> Vec<DeviceInfo> {
     state.manager.lock().rescan();
     state.device_generation.fetch_add(1, Ordering::Relaxed);
     state.seed_runtime();
-    let infos = infos_with_names(&state);
+    let infos = infos_with_names(state);
     let _ = app.emit("devices-changed", infos.clone());
     infos
 }

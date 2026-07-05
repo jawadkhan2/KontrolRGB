@@ -189,9 +189,20 @@ pub fn probe() -> Result<Option<MsiDevice>, DeviceError> {
 /// grab below, coalesces to the freshest frame so motion stays smooth.
 const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(50);
 
-fn worker(ctl: MsiController, shared: Arc<Shared>) {
+/// After this many consecutive failed frames, start trying to re-open the
+/// controller. Sleep / monitor-off can make Windows re-enumerate the device,
+/// which kills the old HID handle for good — no write on it will ever succeed
+/// again, so re-arming direct mode isn't enough; only a fresh open recovers.
+const RECONNECT_AFTER_FAILURES: u32 = 3;
+/// Between reconnect attempts, this many more failed frames must pass (each
+/// failure sleeps 500ms, so attempts land roughly every 2s). Re-opening
+/// enumerates the whole HID tree; don't hammer it.
+const RECONNECT_EVERY_FAILURES: u32 = 4;
+
+fn worker(mut ctl: MsiController, shared: Arc<Shared>) {
     let mut seen_generation = 0u64;
     let mut pending_retry = false;
+    let mut consecutive_failures = 0u32;
     let mut last_write = std::time::Instant::now();
 
     // Spawn the watchdog that aborts a HID write the MCU stalls on (~5s freeze).
@@ -236,10 +247,39 @@ fn worker(ctl: MsiController, shared: Arc<Shared>) {
 
         last_write = std::time::Instant::now();
         match write_frame(&ctl, &guard, &frame) {
-            Ok(_rearms) => pending_retry = false,
+            Ok(_rearms) => {
+                pending_retry = false;
+                consecutive_failures = 0;
+            }
             Err(e) => {
                 pending_retry = true;
-                eprintln!("msi: frame write failed: {e}");
+                consecutive_failures += 1;
+                eprintln!("msi: frame write failed ({consecutive_failures} in a row): {e}");
+                if consecutive_failures >= RECONNECT_AFTER_FAILURES
+                    && (consecutive_failures - RECONNECT_AFTER_FAILURES)
+                        .is_multiple_of(RECONNECT_EVERY_FAILURES)
+                {
+                    match MsiController::open() {
+                        Ok(Some(new_ctl)) => {
+                            match guarded(&guard, || new_ctl.send_setup()) {
+                                Ok(()) => {
+                                    eprintln!(
+                                        "msi: controller re-opened after {consecutive_failures} failed frames"
+                                    );
+                                    ctl = new_ctl;
+                                    consecutive_failures = 0;
+                                    // Rewrite the latest frame right away.
+                                    continue;
+                                }
+                                Err(e) => eprintln!("msi: reconnect setup failed: {e}"),
+                            }
+                        }
+                        Ok(None) => {
+                            eprintln!("msi: reconnect: controller not enumerated (yet)")
+                        }
+                        Err(e) => eprintln!("msi: reconnect failed: {e}"),
+                    }
+                }
                 thread::sleep(Duration::from_millis(500));
             }
         }

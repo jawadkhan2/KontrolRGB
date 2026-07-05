@@ -625,8 +625,20 @@ impl Nct6687 {
     pub fn scan_ec(&self) -> Vec<(u16, u8)> {
         // Full EC address space (all 256 pages) so a config register MSI Center
         // writes anywhere — e.g. a fan step-up / response time — is captured.
+        //
+        // Bounded by a wall-clock budget: each `ec_read` can spin up to 500ms
+        // waiting for the page register to free (a misbehaving/contended EC
+        // window), and 65 536 of those back-to-back could pin the ISA bus for
+        // minutes. Cap the whole scan so a diagnostic can never wedge the app —
+        // we return whatever was captured before the deadline.
+        const SCAN_BUDGET: Duration = Duration::from_secs(10);
+        let deadline = Instant::now() + SCAN_BUDGET;
         let mut out = Vec::with_capacity(0x10000);
         for page in 0..=0xFFu16 {
+            if Instant::now() >= deadline {
+                eprintln!("[ec scan] budget hit after {} regs — returning partial", out.len());
+                break;
+            }
             for i in 0..=0xFFu16 {
                 let addr = (page << 8) | i;
                 if let Ok(v) = self.ec_read(addr) {
@@ -684,6 +696,27 @@ impl Nct6687 {
         // bit alone does NOT release on Z890 — the change must be committed.
         self.commit_duty(index, saved.duty)?;
         self.saved.lock()[index] = None;
+        Ok(())
+    }
+
+    /// Force one header back to the BIOS SmartFAN curve WITHOUT any saved state —
+    /// the crash-recovery path. After an unclean shutdown we no longer hold the
+    /// original BIOS duty (it lived only in the dead process's memory), so we
+    /// can't restore it byte-for-byte like `release_header`. Instead we clear the
+    /// header's manual-mode bit and commit: with the bit clear the EC's curve
+    /// engine ignores the command register and resumes driving the fan itself, so
+    /// the exact command byte no longer matters. Only ever called for headers this
+    /// app is known to control (the persisted `pwm_map`), never CPU/pump.
+    pub fn force_release_header(&self, index: usize) -> Result<(), ChipError> {
+        let ctl = FAN_CTL.get(index).ok_or(ChipError::EcUnresponsive(0))?;
+        // Atomic vs other tools across the clear + commit (recursive lock).
+        let _isa = self.lpc.isa_lock();
+        let mode = self.ec_read(ctl.mode_reg)?;
+        self.ec_write(ctl.mode_reg, mode & !(1u8 << ctl.mode_bit))?;
+        // Commit the current command byte so the mode-bit clear sticks on Z890
+        // (clearing the bit alone does not release until committed).
+        let duty = self.ec_read(ctl.cmd)?;
+        self.commit_duty(index, duty)?;
         Ok(())
     }
 
