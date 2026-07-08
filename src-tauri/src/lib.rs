@@ -91,7 +91,6 @@ pub fn run() {
             commands::resize_zone,
             commands::rename_zone,
             commands::identify_zone,
-            commands::apply_to_all,
             commands::rescan_devices,
             commands::fan_status,
             commands::fan_snapshot,

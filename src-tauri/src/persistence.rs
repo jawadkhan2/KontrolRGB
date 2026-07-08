@@ -21,8 +21,11 @@ struct ConfigFile {
     devices: HashMap<DeviceId, DeviceConfig>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct DeviceConfig {
+/// One device's saved config. `pub(crate)` (with private fields) because
+/// `AppState` holds a map of these for devices that were absent at load — see
+/// `stale_device_configs` — but all access stays in this module.
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct DeviceConfig {
     #[serde(flatten)]
     runtime: DeviceRuntimeState,
     #[serde(default)]
@@ -39,8 +42,31 @@ fn config_path(app: &tauri::AppHandle) -> Option<PathBuf> {
         .map(|d| d.join("config.json"))
 }
 
+/// Apply one saved device config to a live device: restore zone LED counts,
+/// runtime state, and zone-name overrides. Shared by the initial load and the
+/// post-rescan re-apply so a device that appears later gets its saved settings.
+fn apply_device_config(
+    device: &mut Box<dyn crate::device::RgbDevice>,
+    runtime: &mut HashMap<DeviceId, DeviceRuntimeState>,
+    zone_names: &mut HashMap<DeviceId, HashMap<String, String>>,
+    id: &DeviceId,
+    dev_config: DeviceConfig,
+) {
+    for (zone_id, count) in &dev_config.zone_led_counts {
+        if let Err(e) = device.resize_zone(zone_id, *count) {
+            eprintln!("restore resize {id}/{zone_id}: {e}");
+        }
+    }
+    if !dev_config.zone_names.is_empty() {
+        zone_names.insert(id.clone(), dev_config.zone_names);
+    }
+    runtime.insert(id.clone(), dev_config.runtime);
+}
+
 /// Load config and apply it: resize zones, seed runtime states. Call from
-/// setup after the first device scan. Unknown device ids are ignored.
+/// setup after the first device scan. Configs for devices that aren't present
+/// are stashed (not dropped) so a later hot-plug/rescan restores them and a
+/// save in the meantime doesn't erase them.
 pub fn load_and_apply(app: &tauri::AppHandle, state: &AppState) {
     state.seed_runtime();
     let Some(path) = config_path(app) else { return };
@@ -57,19 +83,46 @@ pub fn load_and_apply(app: &tauri::AppHandle, state: &AppState) {
     let mut manager = state.manager.lock();
     let mut runtime = state.runtime.lock();
     let mut zone_names = state.zone_names.lock();
+    let mut stale = state.stale_device_configs.lock();
     for (id, dev_config) in config.devices {
-        let Some(device) = manager.get_mut(&id) else {
-            continue;
-        };
-        for (zone_id, count) in &dev_config.zone_led_counts {
-            if let Err(e) = device.resize_zone(zone_id, *count) {
-                eprintln!("restore resize {id}/{zone_id}: {e}");
+        match manager.get_mut(&id) {
+            Some(device) => {
+                apply_device_config(device, &mut runtime, &mut zone_names, &id, dev_config);
+            }
+            // Device absent right now — keep its config so a rescan can restore
+            // it and `snapshot` doesn't drop it on the next save.
+            None => {
+                stale.insert(id, dev_config);
             }
         }
-        if !dev_config.zone_names.is_empty() {
-            zone_names.insert(id.clone(), dev_config.zone_names);
+    }
+}
+
+/// Re-apply any stashed config to devices that have since appeared (hot-plug,
+/// wake-from-sleep re-enumeration, or a manual rescan). Removes each config from
+/// the stale store once its device is present and restored. Call after a
+/// `manager.rescan()` + `seed_runtime()`.
+pub fn reapply_after_rescan(state: &AppState) {
+    let mut manager = state.manager.lock();
+    let mut runtime = state.runtime.lock();
+    let mut zone_names = state.zone_names.lock();
+    let mut stale = state.stale_device_configs.lock();
+    if stale.is_empty() {
+        return;
+    }
+    let present: Vec<DeviceId> = manager
+        .infos()
+        .into_iter()
+        .map(|i| i.id)
+        .filter(|id| stale.contains_key(id))
+        .collect();
+    for id in present {
+        let Some(dev_config) = stale.remove(&id) else {
+            continue;
+        };
+        if let Some(device) = manager.get_mut(&id) {
+            apply_device_config(device, &mut runtime, &mut zone_names, &id, dev_config);
         }
-        runtime.insert(id, dev_config.runtime);
     }
 }
 
@@ -91,7 +144,7 @@ fn snapshot(state: &AppState) -> ConfigFile {
         .collect();
 
     let zone_names = state.zone_names.lock();
-    let devices = state
+    let mut devices: HashMap<DeviceId, DeviceConfig> = state
         .runtime
         .lock()
         .iter()
@@ -106,6 +159,13 @@ fn snapshot(state: &AppState) -> ConfigFile {
             )
         })
         .collect();
+
+    // Preserve configs for devices absent this session so unplugging a keyboard
+    // (or a device missing at boot) never wipes its saved effect/zones. A live
+    // device always wins over its stale copy, so `entry` here never clobbers.
+    for (id, cfg) in state.stale_device_configs.lock().iter() {
+        devices.entry(id.clone()).or_insert_with(|| cfg.clone());
+    }
 
     ConfigFile {
         version: 1,

@@ -34,6 +34,11 @@ pub struct AppState {
     /// User-renamed zones: device_id -> zone_id -> custom name. Overlaid onto
     /// DeviceInfo before it reaches the frontend; persisted in config.
     pub zone_names: Mutex<HashMap<DeviceId, HashMap<String, String>>>,
+    /// Saved config for devices NOT present this session (unplugged, or absent
+    /// at boot). Held so a rescan can restore them and a save in the meantime
+    /// doesn't erase them; drained into the live state by `reapply_after_rescan`
+    /// as devices reappear.
+    pub stale_device_configs: Mutex<HashMap<DeviceId, crate::persistence::DeviceConfig>>,
     /// Active "identify" pulses: device_id -> (zone_id, start time). Transient
     /// (not persisted); the effects engine pulses the zone until it expires.
     pub identify: Mutex<HashMap<DeviceId, (String, Instant)>>,
@@ -65,6 +70,7 @@ impl AppState {
             manager: Mutex::new(DeviceManager::new()),
             runtime: Mutex::new(HashMap::new()),
             zone_names: Mutex::new(HashMap::new()),
+            stale_device_configs: Mutex::new(HashMap::new()),
             identify: Mutex::new(HashMap::new()),
             dirty: AtomicBool::new(false),
             device_generation: AtomicU64::new(0),

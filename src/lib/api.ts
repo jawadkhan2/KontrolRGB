@@ -33,9 +33,6 @@ export const renameZone = (deviceId: string, zoneId: string, name: string) =>
 export const identifyZone = (deviceId: string, zoneId: string) =>
   invoke<void>("identify_zone", { deviceId, zoneId });
 
-export const applyToAll = (effect: EffectConfig, brightness?: number) =>
-  invoke<void>("apply_to_all", { effect, brightness: brightness ?? null });
-
 export const rescanDevices = () => invoke<DeviceInfo[]>("rescan_devices");
 
 // --- GPU telemetry (NVML) -------------------------------------------------

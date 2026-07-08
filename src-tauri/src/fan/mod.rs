@@ -649,6 +649,12 @@ impl FanSubsystem {
     #[cfg(windows)]
     pub fn release_to_bios(&self) -> Result<(), FanError> {
         let mut inner = self.inner.lock();
+        // Mark the plan released backend-side too, so the control loop can't
+        // re-assert a fan in the window between this release and the frontend's
+        // own (fire-and-forget) released-plan push landing.
+        if let Some(plan) = inner.control_plan.as_mut() {
+            plan.released = true;
+        }
         if !inner.manual_session_active {
             return Ok(());
         }
@@ -660,6 +666,7 @@ impl FanSubsystem {
         chip.release_to_bios()?;
         inner.manual_session_active = false;
         disarm_marker(&mut inner);
+        clear_control_cache(&mut inner);
         Ok(())
     }
 
@@ -790,20 +797,35 @@ impl FanSubsystem {
             }
         }
 
-        // Phase 1 — burst every non-pump header to full duty.
+        // Phase 1 — burst every non-pump header to full duty. The session flag,
+        // heartbeat, and crash marker are armed BEFORE the first write: if a
+        // write fails partway, the headers already at 100% must still be covered
+        // by the watchdog and crash recovery, not silently stranded.
         {
             let mut inner = self.inner.lock();
             Self::ensure_open(&mut inner);
-            let chip = inner
-                .chip
-                .as_ref()
-                .ok_or_else(|| FanError::Unavailable(inner.detail.clone()))?;
-            for &(header, _) in &header_tach {
-                chip.set_manual_pwm(header as usize, 255)?;
+            if inner.chip.is_none() {
+                return Err(FanError::Unavailable(inner.detail.clone()));
             }
             inner.manual_session_active = true;
             inner.last_heartbeat = Instant::now();
             arm_marker(&mut inner);
+            let chip = inner.chip.as_ref().expect("checked above");
+            let mut write_err: Option<nct6687::ChipError> = None;
+            for &(header, _) in &header_tach {
+                if let Err(e) = chip.set_manual_pwm(header as usize, 255) {
+                    write_err = Some(e);
+                    break;
+                }
+            }
+            if let Some(e) = write_err {
+                // Hand back whatever we already took, then undo the session arm.
+                let _ = chip.release_to_bios();
+                inner.manual_session_active = false;
+                disarm_marker(&mut inner);
+                clear_control_cache(&mut inner);
+                return Err(e.into());
+            }
         }
 
         // Phase 2 — hold the burst for the fixed window, sampling RPM so the modal
@@ -871,6 +893,10 @@ impl FanSubsystem {
         }
         inner.manual_session_active = false;
         disarm_marker(&mut inner);
+        // Headers just went back to the BIOS; the control loop's write-dedup
+        // cache is now stale (it thinks its last duty is still applied), so
+        // clear it or the loop would skip re-asserting an unchanged target.
+        clear_control_cache(&mut inner);
         if let Some(e) = read_err {
             return Err(e);
         }
@@ -1003,10 +1029,20 @@ impl FanSubsystem {
             rpm_channel as usize,
             &self.sweep_cancel,
             &on_progress,
-        )?;
-        // sweep_header restores the header to BIOS itself (also on cancel, where it
-        // returns SweepCancelled and we never touch the limits below).
+        );
+        if result.is_err() {
+            // Cancel releases the header itself, but a mid-sweep chip error can
+            // leave it held at the last duty. release_to_bios is a no-op for
+            // headers already handed back, so this is safe on every error path.
+            let _ = chip.release_to_bios();
+        }
+        // On EVERY exit — success, cancel, or error — the header is back on the
+        // BIOS, so the session flag and the control loop's write-dedup cache
+        // must reset; a stale cache would make the loop skip re-asserting an
+        // unchanged target and silently leave the fan on the BIOS curve.
         inner.manual_session_active = false;
+        clear_control_cache(&mut inner);
+        let result = result?;
         inner.limits.entry(header).or_default().apply_sweep(&result);
         Ok(result)
     }
@@ -1056,10 +1092,19 @@ impl FanSubsystem {
             .ok_or_else(|| FanError::Unavailable(inner.detail.clone()))?;
         let results = chip.sweep_headers(&targets, &self.sweep_cancel, &|channel, pct, rpm, phase| {
             on_progress(channel as u8, pct, rpm, phase)
-        })?;
-        // sweep_headers restores every header to BIOS itself (also on cancel,
-        // where it returns SweepCancelled and we never touch the limits below).
+        });
+        if results.is_err() {
+            // Cancel releases the headers itself, but a mid-sweep chip error can
+            // leave some held; release_to_bios is a no-op for headers already
+            // handed back, so this is safe on every error path.
+            let _ = chip.release_to_bios();
+        }
+        // Same cleanup contract as `sweep`: on every exit the headers are back
+        // on the BIOS, so reset the session flag and the control loop's
+        // write-dedup cache (a stale cache would strand fans on the BIOS).
         inner.manual_session_active = false;
+        clear_control_cache(&mut inner);
+        let results = results?;
         let mut out = Vec::with_capacity(targets.len());
         for (&(header, rpm_channel), result) in targets.iter().zip(results) {
             inner
@@ -1237,6 +1282,10 @@ impl FanSubsystem {
                 eprintln!(
                     "[fan] thermal failsafe cleared ({hottest:.1}°C) — resuming curve/manual control"
                 );
+                // The hysteresis anchors predate the emergency; left in place
+                // they can hold curve fans at 100% until the source drifts
+                // CURVE_HYSTERESIS_C from a stale reading. Re-anchor now.
+                control_last_temp.clear();
             }
             *emergency_active = emergency;
         }
@@ -1452,6 +1501,18 @@ fn arm_marker(inner: &mut Inner) {
     inner.marker_armed = true;
 }
 
+/// Reset the control loop's per-channel memory (write-dedup + curve-hysteresis
+/// anchors). MUST be called whenever headers are handed back to the BIOS while
+/// a plan may still be installed (STOP, watchdog, sweep/burst cleanup): the
+/// cache says "this duty is already applied", so without the reset the loop
+/// would skip the re-assert and leave fans on the BIOS curve while the UI shows
+/// them controlled.
+#[cfg(windows)]
+fn clear_control_cache(inner: &mut Inner) {
+    inner.control_last_commanded.clear();
+    inner.control_last_temp.clear();
+}
+
 /// Remove the crash-recovery marker on a clean handoff back to the BIOS (STOP,
 /// watchdog release, burst/sweep cleanup). A missing marker at next launch means
 /// we exited cleanly and left no fan stranded.
@@ -1486,6 +1547,7 @@ fn start_watchdog(inner: Arc<Mutex<Inner>>) {
         }
         guard.manual_session_active = false;
         disarm_marker(&mut guard);
+        clear_control_cache(&mut guard);
     });
 }
 

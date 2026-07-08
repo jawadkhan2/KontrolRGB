@@ -28,7 +28,6 @@ interface DevicesStore {
   resizeZone: (deviceId: string, zoneId: string, ledCount: number) => void;
   renameZone: (deviceId: string, zoneId: string, name: string) => void;
   identifyZone: (deviceId: string, zoneId: string) => void;
-  applyToAll: (effect: EffectConfig, brightness?: number) => void;
   rescan: () => void;
 }
 
@@ -170,18 +169,6 @@ export const useDevices = create<DevicesStore>((set, get) => ({
 
   identifyZone: (deviceId, zoneId) => {
     void api.identifyZone(deviceId, zoneId);
-  },
-
-  applyToAll: (effect, brightness) => {
-    set((s) => ({
-      states: Object.fromEntries(
-        Object.entries(s.states).map(([id, st]) => [
-          id,
-          { ...st, effect, brightness: brightness ?? st.brightness },
-        ]),
-      ),
-    }));
-    void api.applyToAll(effect, brightness);
   },
 
   rescan: () => {

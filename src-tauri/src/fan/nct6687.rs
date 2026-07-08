@@ -489,6 +489,21 @@ impl Nct6687 {
 
     // --- EC paged-window access ---
 
+    /// Wait for the EC page window to be free (reads back 0xFF), max 500ms; if
+    /// it never frees, force it (matches LibreHardwareMonitor). Polls with a
+    /// 1ms sleep rather than a hot spin: every poll is a ring-0 IOCTL, so
+    /// spinning would hammer the driver (and pin a core) while contended.
+    fn ec_wait_window(&self) {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while self.lpc.inb(self.base + EC_PAGE) != EC_PAGE_SELECT {
+            if Instant::now() >= deadline {
+                self.lpc.outb(self.base + EC_PAGE, EC_PAGE_SELECT);
+                break;
+            }
+            sleep(Duration::from_millis(1));
+        }
+    }
+
     /// Read one byte from EC space. Side-effect free w.r.t. fan state.
     fn ec_read(&self, addr: u16) -> Result<u8, ChipError> {
         // Atomic against other ISA-bus tools for the whole page→index→data→release
@@ -497,23 +512,37 @@ impl Nct6687 {
         let page = (addr >> 8) as u8;
         let index = (addr & 0xFF) as u8;
 
-        // Wait for the page register to be free (reads back 0xFF), max 500ms;
-        // if it never frees, force it (matches LibreHardwareMonitor).
-        let deadline = Instant::now() + Duration::from_millis(500);
-        while self.lpc.inb(self.base + EC_PAGE) != EC_PAGE_SELECT {
-            if Instant::now() >= deadline {
-                self.lpc.outb(self.base + EC_PAGE, EC_PAGE_SELECT);
-                break;
-            }
-            std::hint::spin_loop();
-        }
-
+        self.ec_wait_window();
         self.lpc.outb(self.base + EC_PAGE, page);
         self.lpc.outb(self.base + EC_INDEX, index);
         let data = self.lpc.inb(self.base + EC_DATA);
         // Release the window so other readers (and BIOS) can use it.
         self.lpc.outb(self.base + EC_PAGE, EC_PAGE_SELECT);
         Ok(data)
+    }
+
+    /// Read a run of EC addresses in one window acquisition. The one-byte
+    /// handshake costs ~5 port IOCTLs per byte (free-wait, page, index, data,
+    /// release); holding the window open and re-selecting the page only when it
+    /// changes cuts a full monitoring snapshot's ring-0 round-trips roughly in
+    /// half. Runs under the ISA lock, so no other tool can interleave while the
+    /// window is held; the window is always released before returning.
+    fn ec_read_batch(&self, addrs: &[u16]) -> Result<Vec<u8>, ChipError> {
+        let _isa = self.lpc.isa_lock();
+        self.ec_wait_window();
+        let mut out = Vec::with_capacity(addrs.len());
+        let mut cur_page: Option<u8> = None;
+        for &addr in addrs {
+            let page = (addr >> 8) as u8;
+            if cur_page != Some(page) {
+                self.lpc.outb(self.base + EC_PAGE, page);
+                cur_page = Some(page);
+            }
+            self.lpc.outb(self.base + EC_INDEX, (addr & 0xFF) as u8);
+            out.push(self.lpc.inb(self.base + EC_DATA));
+        }
+        self.lpc.outb(self.base + EC_PAGE, EC_PAGE_SELECT);
+        Ok(out)
     }
 
     fn ec_read_u16(&self, addr: u16) -> Result<u16, ChipError> {
@@ -525,23 +554,37 @@ impl Nct6687 {
     /// Read every channel: RPM for all 16, PWM-out + manual flag for the 8
     /// controllable headers. Pure read — never mutates fan state.
     pub fn read_all(&self) -> Result<Vec<ChannelReading>, ChipError> {
-        // Hold the ISA bus once for the whole snapshot so the ~40 per-byte EC
-        // reads below don't thrash the (recursive) lock; the inner per-access
-        // locks nest harmlessly.
-        let _isa = self.lpc.isa_lock();
-        let mut out = Vec::with_capacity(FAN_RPM_REG.len());
+        // Compose one flat address list (RPM hi/lo per tach, plus duty + mode
+        // for channels that map to a control header) and fetch it in a single
+        // batched window pass instead of ~40 one-byte handshakes.
+        let mut addrs: Vec<u16> = Vec::with_capacity(FAN_RPM_REG.len() * 4);
         for (i, &reg) in FAN_RPM_REG.iter().enumerate() {
+            addrs.push(reg);
+            addrs.push(reg + 1);
+            if let Some(h) = header_for_rpm_channel(i) {
+                addrs.push(FAN_CTL[h].pwm_read);
+                addrs.push(FAN_CTL[h].mode_reg);
+            }
+        }
+        let bytes = self.ec_read_batch(&addrs)?;
+        let mut bytes = bytes.into_iter();
+
+        let mut out = Vec::with_capacity(FAN_RPM_REG.len());
+        for i in 0..FAN_RPM_REG.len() {
             // 16-channel tach dump for monitoring (the index is the tach position
             // the user confirms). Where a tach channel corresponds to a control
             // header under the msi_alt map, show that header's real label, duty
             // and manual flag; other positions are tach-only.
-            let rpm = decode_rpm(self.ec_read_u16(reg)?);
+            let hi = bytes.next().unwrap_or(0) as u16;
+            let lo = bytes.next().unwrap_or(0) as u16;
+            let rpm = decode_rpm((hi << 8) | lo);
             let (label, pwm_pct, manual) = match header_for_rpm_channel(i) {
                 Some(h) => {
                     let ctl = &FAN_CTL[h];
-                    let duty = self.ec_read(ctl.pwm_read)?;
+                    let duty = bytes.next().unwrap_or(0);
+                    let mode = bytes.next().unwrap_or(0);
                     let pct = ((duty as u16 * 100) / 255) as u8;
-                    let man = (self.ec_read(ctl.mode_reg)? >> ctl.mode_bit) & 1 == 1;
+                    let man = (mode >> ctl.mode_bit) & 1 == 1;
                     (ctl.label.to_string(), Some(pct), Some(man))
                 }
                 None => (format!("RPM ch {i}"), None, None),
@@ -560,13 +603,14 @@ impl Nct6687 {
     /// Read all temperature sensors. Returns only sensors with plausible values
     /// (1..=110 °C); unconnected or invalid sensors are silently omitted.
     pub fn read_temps(&self) -> Result<Vec<TempReading>, ChipError> {
-        // One bus lock for the whole sensor sweep (recursive with per-access locks).
-        let _isa = self.lpc.isa_lock();
+        // One batched window pass for the whole sensor sweep.
+        let addrs: Vec<u16> = TEMP_REGS.iter().flat_map(|&(a, _, _)| [a, a + 1]).collect();
+        let bytes = self.ec_read_batch(&addrs)?;
         let mut out = Vec::new();
-        for &(addr, key, label) in TEMP_REGS {
+        for (j, &(_, key, label)) in TEMP_REGS.iter().enumerate() {
             // 16-bit: hi byte = signed °C, bit 7 of lo byte = 0.5° fraction.
-            let hi = self.ec_read(addr)? as i8;
-            let lo = self.ec_read(addr + 1)?;
+            let hi = bytes[j * 2] as i8;
+            let lo = bytes[j * 2 + 1];
             let temp = hi as f32 + if lo & 0x80 != 0 { 0.5 } else { 0.0 };
             if (1.0..=110.0).contains(&temp) {
                 out.push(TempReading {
@@ -595,14 +639,7 @@ impl Nct6687 {
         let _isa = self.lpc.isa_lock();
         let page = (addr >> 8) as u8;
         let index = (addr & 0xFF) as u8;
-        let deadline = Instant::now() + Duration::from_millis(500);
-        while self.lpc.inb(self.base + EC_PAGE) != EC_PAGE_SELECT {
-            if Instant::now() >= deadline {
-                self.lpc.outb(self.base + EC_PAGE, EC_PAGE_SELECT);
-                break;
-            }
-            std::hint::spin_loop();
-        }
+        self.ec_wait_window();
         self.lpc.outb(self.base + EC_PAGE, page);
         self.lpc.outb(self.base + EC_INDEX, index);
         self.lpc.outb(self.base + EC_DATA, value);

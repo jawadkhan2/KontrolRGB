@@ -24,10 +24,13 @@ export type View = "sync" | "devices" | "library" | "fans" | "settings";
 
 /**
  * Display refresh cadence for live fan readings. This only updates the UI —
- * actual fan control runs in the Rust backend's control loop, so this throttling
- * to ~1/min when the window is hidden no longer affects fan behaviour.
+ * actual fan control runs in the Rust backend's control loop, so the cadence
+ * (and skipping the poll entirely while the window is hidden) never affects fan
+ * behaviour. Each snapshot is a batched ring-0 EC read under the shared ISA-bus
+ * mutex, so a slower poll cuts contention with the 1s control loop and any other
+ * hardware-monitor tool without any visible UI cost.
  */
-const FAN_POLL_MS = 400;
+const FAN_POLL_MS = 1000;
 
 const TYPE_SEG: Record<string, string> = {
   keyboard: "var(--kb)",
@@ -89,11 +92,12 @@ export default function App() {
     let id = 0;
     const tick = async () => {
       const f = useFans.getState();
-      if (f.burstDone) {
+      // Done, or the user disabled startup auto-detect → stop waking every 1.5s.
+      if (f.burstDone || !useSettings.getState().burstOnStartup) {
         clearInterval(id);
         return;
       }
-      if (!useSettings.getState().burstOnStartup || f.burstDetecting) return;
+      if (f.burstDetecting) return;
       try {
         const st = await fanStatus();
         if (st.available) await f.runBurstDetect();
@@ -109,7 +113,12 @@ export default function App() {
   // open. Fan *control* no longer lives here — it runs in the backend control
   // loop (immune to webview timer throttling); this only updates the UI.
   useEffect(() => {
-    const run = () => void useFans.getState().refresh();
+    // Skip the poll while the window is hidden — no UI is visible to update, and
+    // the backend control loop keeps driving fans regardless.
+    const run = () => {
+      if (document.hidden) return;
+      void useFans.getState().refresh();
+    };
     run();
     const t = window.setInterval(run, FAN_POLL_MS);
     return () => clearInterval(t);

@@ -204,24 +204,6 @@ pub fn identify_zone(state: State<'_, Arc<AppState>>, device_id: DeviceId, zone_
 }
 
 #[tauri::command]
-pub fn apply_to_all(
-    state: State<'_, Arc<AppState>>,
-    effect: EffectConfig,
-    brightness: Option<u8>,
-) -> CmdResult<()> {
-    let mut runtime = state.runtime.lock();
-    for rt in runtime.values_mut() {
-        rt.effect = effect.clone();
-        if let Some(b) = brightness {
-            rt.brightness = b.min(100);
-        }
-    }
-    drop(runtime);
-    mark_dirty(&state);
-    Ok(())
-}
-
-#[tauri::command]
 pub fn rescan_devices(app: AppHandle, state: State<'_, Arc<AppState>>) -> Vec<DeviceInfo> {
     rescan_and_notify(&app, &state)
 }
@@ -234,6 +216,9 @@ pub fn rescan_and_notify(app: &AppHandle, state: &AppState) -> Vec<DeviceInfo> {
     state.manager.lock().rescan();
     state.device_generation.fetch_add(1, Ordering::Relaxed);
     state.seed_runtime();
+    // Restore saved config for any device that (re)appeared this scan, so a
+    // hot-plug or wake-from-sleep re-enumeration doesn't leave it on defaults.
+    crate::persistence::reapply_after_rescan(state);
     let infos = infos_with_names(state);
     let _ = app.emit("devices-changed", infos.clone());
     infos
