@@ -903,10 +903,24 @@ impl FanSubsystem {
 
         let mut detected = Vec::new();
         for &(header, ch) in &header_tach {
+            let ch = ch as u8;
             if *last_rpm.get(&header).unwrap_or(&0) == 0 {
+                // The header was held at 100% duty for the whole burst and its
+                // tach never moved: there is no fan connected. Prune any stale
+                // mapping/confirmation for it (e.g. one persisted while a read
+                // bug made every channel look alive), or a phantom fan card
+                // would keep showing on every launch.
+                let was_mapped = inner.pwm_map.remove(&ch).is_some();
+                let was_confirmed = inner.confirmed_rpm_channels.contains(&ch);
+                inner.confirmed_rpm_channels.retain(|&c| c != ch);
+                inner.limits.remove(&header);
+                if was_mapped || was_confirmed {
+                    eprintln!(
+                        "[fan burst] header {header} (tach {ch}): no fan — stale mapping pruned"
+                    );
+                }
                 continue;
             }
-            let ch = ch as u8;
             if !inner.confirmed_rpm_channels.contains(&ch) {
                 inner.confirmed_rpm_channels.push(ch);
             }

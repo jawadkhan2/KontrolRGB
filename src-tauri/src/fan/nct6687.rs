@@ -521,28 +521,22 @@ impl Nct6687 {
         Ok(data)
     }
 
-    /// Read a run of EC addresses in one window acquisition. The one-byte
-    /// handshake costs ~5 port IOCTLs per byte (free-wait, page, index, data,
-    /// release); holding the window open and re-selecting the page only when it
-    /// changes cuts a full monitoring snapshot's ring-0 round-trips roughly in
-    /// half. Runs under the ISA lock, so no other tool can interleave while the
-    /// window is held; the window is always released before returning.
+    /// Read a run of EC addresses under one ISA-lock acquisition, so no other
+    /// tool can interleave with the snapshot.
+    ///
+    /// Each byte runs the FULL `ec_read` handshake (wait-for-window, page,
+    /// index, data, release). Do NOT try to hoist any part of it out of the
+    /// loop: the EC treats the whole 0xFF→page→index→data→0xFF cycle as one
+    /// transaction. Two attempts to amortize it both broke reads the same way —
+    /// reusing the page across bytes, and re-writing the page without the 0xFF
+    /// arm first — in both cases the index write was ignored and the data port
+    /// replayed the previously latched byte, so every 16-bit tach read came
+    /// back `hi<<8|hi` (all fans "2056 RPM", phantom fans on empty channels,
+    /// sawtooth graphs from 257-RPM quantization, temps cloned from the first
+    /// sensor). The only safe batching is holding the ISA lock across the run.
     fn ec_read_batch(&self, addrs: &[u16]) -> Result<Vec<u8>, ChipError> {
         let _isa = self.lpc.isa_lock();
-        self.ec_wait_window();
-        let mut out = Vec::with_capacity(addrs.len());
-        let mut cur_page: Option<u8> = None;
-        for &addr in addrs {
-            let page = (addr >> 8) as u8;
-            if cur_page != Some(page) {
-                self.lpc.outb(self.base + EC_PAGE, page);
-                cur_page = Some(page);
-            }
-            self.lpc.outb(self.base + EC_INDEX, (addr & 0xFF) as u8);
-            out.push(self.lpc.inb(self.base + EC_DATA));
-        }
-        self.lpc.outb(self.base + EC_PAGE, EC_PAGE_SELECT);
-        Ok(out)
+        addrs.iter().map(|&addr| self.ec_read(addr)).collect()
     }
 
     fn ec_read_u16(&self, addr: u16) -> Result<u16, ChipError> {

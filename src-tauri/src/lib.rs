@@ -22,9 +22,23 @@ use state::AppState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app_state = Arc::new(AppState::new());
+    // If we were spawned by our own "relaunch as admin", the old unelevated
+    // process still owns the HID handles, the fan driver and the single-instance
+    // mutex. Block until it's gone before we touch any of it.
+    admin::wait_for_parent_exit();
 
     tauri::Builder::default()
+        // Registered first, deliberately: plugin setups run in registration
+        // order, so this one claims the mutex — and bounces a second launch back
+        // into the running instance — before anything else initialises. Two
+        // processes driving the EC and the RGB controllers at once corrupts both,
+        // so nothing that touches hardware may run ahead of this. That includes
+        // `AppState::new()`, which probes the devices; it is built inside `setup`
+        // (below) rather than here, because a bounced instance exits during
+        // plugin setup and must never have opened a device handle.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
@@ -36,8 +50,13 @@ pub fn run() {
                 .args(["--minimized"])
                 .build(),
         )
-        .manage(app_state.clone())
-        .setup(move |app| {
+        .setup(|app| {
+            // First hardware contact: DeviceManager::new() probes the USB/HID
+            // controllers. Safe here — the single-instance plugin has already
+            // run, so we know we're the only process.
+            let app_state = Arc::new(AppState::new());
+            app.manage(app_state.clone());
+
             let handle = app.handle().clone();
             persistence::load_and_apply(&handle, &app_state);
             // Crash-recovery: if a prior unclean exit left the marker behind, the
