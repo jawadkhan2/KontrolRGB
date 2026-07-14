@@ -76,7 +76,9 @@ fn message_loop() {
     use windows_sys::Win32::System::Power::{
         RegisterPowerSettingNotification, POWERBROADCAST_SETTING,
     };
-    use windows_sys::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE;
+    use windows_sys::Win32::System::SystemServices::{
+        GUID_CONSOLE_DISPLAY_STATE, GUID_SESSION_DISPLAY_STATUS,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW,
         TranslateMessage, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
@@ -99,10 +101,13 @@ fn message_loop() {
                 PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => notify_wake(),
                 PBT_POWERSETTINGCHANGE => {
                     let setting = unsafe { &*(lparam as *const POWERBROADCAST_SETTING) };
-                    // CONSOLE_DISPLAY_STATE data: 0 = off, 1 = on, 2 = dimmed.
-                    // Only display-ON matters — that's the moment the user is
-                    // back and the USB devices are (re)waking.
-                    if guid_eq(&setting.PowerSetting, &GUID_CONSOLE_DISPLAY_STATE)
+                    // Display state data: 0 = off, 1 = on, 2 = dimmed. Only
+                    // display-ON matters — that's the moment the user is back
+                    // and the USB devices are (re)waking. Both the console and
+                    // per-session GUIDs are subscribed (either can be the only
+                    // one delivered depending on session); dupes are debounced.
+                    if (guid_eq(&setting.PowerSetting, &GUID_CONSOLE_DISPLAY_STATE)
+                        || guid_eq(&setting.PowerSetting, &GUID_SESSION_DISPLAY_STATUS))
                         && setting.DataLength >= 1
                         && setting.Data[0] == 1
                     {
@@ -153,8 +158,12 @@ fn message_loop() {
         // HPOWERNOTIFY is an isize handle in windows-sys; 0 = failure.
         let reg = RegisterPowerSettingNotification(hwnd, &GUID_CONSOLE_DISPLAY_STATE, 0);
         if reg == 0 {
-            eprintln!("power-watch: RegisterPowerSettingNotification failed");
+            eprintln!("power-watch: RegisterPowerSettingNotification (console) failed");
             // Keep running: plain suspend/resume broadcasts still arrive.
+        }
+        let reg = RegisterPowerSettingNotification(hwnd, &GUID_SESSION_DISPLAY_STATUS, 0);
+        if reg == 0 {
+            eprintln!("power-watch: RegisterPowerSettingNotification (session) failed");
         }
 
         let mut msg: MSG = std::mem::zeroed();

@@ -199,6 +199,15 @@ const RECONNECT_AFTER_FAILURES: u32 = 3;
 /// enumerates the whole HID tree; don't hammer it.
 const RECONNECT_EVERY_FAILURES: u32 = 4;
 
+/// Idle heartbeat: with a static effect the engine goes silent (its frame cache
+/// skips redundant writes), so nothing would ever notice the MCU reverting to
+/// its firmware rainbow after monitor sleep. Rewriting the last frame this
+/// often heals that: if the MCU dropped direct mode the write fails, which
+/// triggers the re-arm/reconnect paths below. The steady feature-report
+/// traffic also keeps Windows from selective-suspending the controller while
+/// the display is off.
+const HEARTBEAT: Duration = Duration::from_secs(3);
+
 fn worker(mut ctl: MsiController, shared: Arc<Shared>) {
     let mut seen_generation = 0u64;
     let mut pending_retry = false;
@@ -218,11 +227,14 @@ fn worker(mut ctl: MsiController, shared: Arc<Shared>) {
     }
 
     loop {
-        // Block until the engine has a newer frame (or we owe a retry / must stop).
+        // Block until the engine has a newer frame (or we owe a retry / must
+        // stop). A HEARTBEAT timeout falls through to rewrite the last frame.
         {
             let mut st = shared.state.lock();
             while !st.stop && st.generation == seen_generation && !pending_retry {
-                shared.cond.wait(&mut st);
+                if shared.cond.wait_for(&mut st, HEARTBEAT).timed_out() {
+                    break;
+                }
             }
             if st.stop {
                 guard.stop.store(true, Ordering::Relaxed);
