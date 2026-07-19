@@ -2008,7 +2008,7 @@ dependencies = [
 
 [[package]]
 name = "kontrolrgb"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "hidapi",
  "kontrolrgb-effects",
