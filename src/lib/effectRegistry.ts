@@ -40,8 +40,11 @@ export interface EffectMeta {
   /** Listed in the Effects Library / Sync grids. Custom + Onboard are
    *  device-page modes, not browsable effects. */
   browsable: boolean;
-  /** Closest firmware mode for devices that can't host-animate (the GMMK). */
-  onboard: { mode: OnboardMode; rainbow: boolean } | null;
+  /** Closest firmware mode for devices that can't host-animate (the GMMK).
+   *  `color` pins the firmware color for paletted effects with no color
+   *  control, so the keyboard stays in the effect's palette instead of the
+   *  user's (unrelated) sync color. */
+  onboard: { mode: OnboardMode; rainbow: boolean; color?: Color } | null;
 }
 
 export const EFFECTS: EffectMeta[] = [
@@ -178,6 +181,61 @@ export const EFFECTS: EffectMeta[] = [
     onboard: { mode: "swirl", rainbow: true },
   },
   {
+    kind: "aurora",
+    label: "Aurora",
+    description: "Northern-lights curtains drifting in teal and violet.",
+    category: "Ambient",
+    tags: ["northern", "lights", "borealis", "curtain", "arctic"],
+    supports: { color: false, speed: true, direction: false },
+    pv: "pv-aurora",
+    browsable: true,
+    onboard: { mode: "wave", rainbow: false, color: { r: 40, g: 235, b: 160 } },
+  },
+  {
+    kind: "vortex",
+    label: "Vortex",
+    description: "Bright arcs orbiting each fan ring.",
+    category: "Motion",
+    tags: ["spin", "orbit", "rotate", "spiral", "radar"],
+    supports: { color: true, speed: true, direction: true },
+    pv: "pv-vortex",
+    browsable: true,
+    onboard: { mode: "swirl", rainbow: false },
+  },
+  {
+    kind: "heartbeat",
+    label: "Heartbeat",
+    description: "A double-thump pulse, every device beating in sync.",
+    category: "Ambient",
+    tags: ["pulse", "beat", "cardiac", "thump", "rhythm"],
+    supports: { color: true, speed: true, direction: false },
+    pv: "pv-heartbeat",
+    browsable: true,
+    onboard: { mode: "breathing", rainbow: false },
+  },
+  {
+    kind: "thunderstorm",
+    label: "Thunderstorm",
+    description: "Dark storm blue split by flickering lightning strikes.",
+    category: "Ambient",
+    tags: ["lightning", "storm", "rain", "flash", "bolt"],
+    supports: { color: false, speed: true, direction: false },
+    pv: "pv-storm",
+    browsable: true,
+    onboard: { mode: "reactive", rainbow: false, color: { r: 150, g: 180, b: 255 } },
+  },
+  {
+    kind: "sunset",
+    label: "Sunset",
+    description: "A dusk gradient sinking from violet sky to golden horizon.",
+    category: "Color",
+    tags: ["dusk", "horizon", "warm", "dawn", "gradient", "sky"],
+    supports: { color: false, speed: true, direction: false },
+    pv: "pv-sunset",
+    browsable: true,
+    onboard: { mode: "wave", rainbow: false, color: { r: 255, g: 120, b: 40 } },
+  },
+  {
     kind: "custom",
     label: "Custom",
     description: "Paint individual keys or LEDs by hand.",
@@ -271,7 +329,7 @@ export function configForDevice(
     return {
       kind: "onboard",
       mode: meta.onboard.mode,
-      color: opts.color,
+      color: (!meta.supports.color && meta.onboard.color) || opts.color,
       rainbow: meta.onboard.rainbow,
       speed: speedPctToOnboard(opts.speedPct),
       reverse: meta.supports.direction ? opts.reverse : false,

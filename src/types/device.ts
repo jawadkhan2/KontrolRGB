@@ -67,6 +67,12 @@ export type EffectConfig =
   | { kind: "larson"; color: Color; speed: number }
   | { kind: "theater_chase"; color: Color; speed: number }
   | { kind: "ripple"; speed: number }
+  // arms is optional: serde defaults it to 2 when the app's generic controls omit it.
+  | { kind: "vortex"; color: Color; speed: number; reverse: boolean; arms?: number }
+  | { kind: "aurora"; speed: number }
+  | { kind: "heartbeat"; color: Color; speed: number }
+  | { kind: "thunderstorm"; speed: number }
+  | { kind: "sunset"; speed: number }
   // Serde flattens the OnboardEffect fields alongside the tag.
   | ({ kind: "onboard" } & OnboardEffect);
 

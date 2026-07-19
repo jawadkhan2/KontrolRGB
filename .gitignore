@@ -36,3 +36,5 @@ captures/
 *.html
 !index.html
 sdf.fwc
+vite.config.js
+vite.config.d.ts

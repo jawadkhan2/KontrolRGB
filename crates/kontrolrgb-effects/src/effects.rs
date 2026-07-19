@@ -166,6 +166,97 @@ pub fn compute_frame(
                 Color::from_hsv(200.0 + r * 120.0, 1.0, level)
             })
             .collect(),
+        EffectConfig::Aurora { speed } => {
+            let ts = t * speed;
+            spatial_positions(zone)
+                .into_iter()
+                .map(|(x, y)| {
+                    // Two curtains drifting at different rates. Integer spatial
+                    // frequencies (x·τ·k) so the pattern closes seamlessly
+                    // around a fan ring, where x wraps 0→1.
+                    let c1 = (x * TAU + ts * 0.31).sin();
+                    let c2 = (x * TAU * 2.0 - ts * 0.17).sin();
+                    let hue = 155.0 + 50.0 * c1 + 30.0 * c2; // teal/green..violet
+                    let shimmer = 0.5 + 0.5 * (x * TAU * 3.0 + ts * 0.9).sin();
+                    // Curtains hang from the top of the zone / ring.
+                    let val = (0.35 + 0.65 * shimmer) * (1.0 - 0.45 * y);
+                    Color::from_hsv(hue, 0.9, val.clamp(0.0, 1.0))
+                })
+                .collect()
+        }
+        EffectConfig::Vortex {
+            color,
+            speed,
+            reverse,
+            arms,
+        } => {
+            let dir = if *reverse { -1.0 } else { 1.0 };
+            let phase = dir * t * speed * 1.8;
+            let arms = (*arms).clamp(1, 4) as f32;
+            // Angle around the zone: physical ring angle on strips, angle
+            // about the layout center on key matrices.
+            let angles: Vec<f32> = if zone.keys.is_some() {
+                key_positions(zone)
+                    .into_iter()
+                    .map(|(x, y)| (y - 0.5).atan2(x - 0.5))
+                    .collect()
+            } else {
+                led_positions(zone).into_iter().map(|p| p * TAU).collect()
+            };
+            angles
+                .into_iter()
+                .map(|a| {
+                    let lobe = 0.5 + 0.5 * (arms * a - phase).cos();
+                    let level = lobe * lobe * lobe * lobe; // sharpen into arcs
+                    color.scale(level)
+                })
+                .collect()
+        }
+        EffectConfig::Heartbeat { color, speed } => {
+            // One beat per second at speed 1: strong systolic thump, softer
+            // diastolic echo, faint resting glow between beats.
+            let ph = (t * speed).rem_euclid(1.0);
+            let g = |c: f32, w: f32| (-((ph - c) * (ph - c)) / (w * w)).exp();
+            let level = (g(0.12, 0.045) + 0.55 * g(0.32, 0.06) + 0.05).min(1.0);
+            vec![color.scale(level); n]
+        }
+        EffectConfig::Thunderstorm { speed } => {
+            let ts = t * speed;
+            let (flash, bolt_x) = lightning(ts);
+            // Near-dark storm base with a slow cloud roll.
+            let breathe = 0.8 + 0.2 * (ts * 0.6).sin();
+            let base = Color { r: 8, g: 16, b: 42 }.scale(breathe);
+            if zone.keys.is_some() {
+                // Bolt lands on a column; the rest of the board sees sky glow.
+                key_positions(zone)
+                    .into_iter()
+                    .map(|(x, _)| {
+                        let d = (x - bolt_x) / 0.10;
+                        let bolt = (-d * d).exp();
+                        let f = flash * (0.25 + 0.75 * bolt);
+                        add_sat(base, Color { r: 200, g: 215, b: 255 }.scale(f))
+                    })
+                    .collect()
+            } else {
+                // Strips/rings (and the GPU lamp): the whole fixture flashes,
+                // like a fan lit by a strike outside the window.
+                vec![add_sat(base, Color { r: 200, g: 215, b: 255 }.scale(flash)); n]
+            }
+        }
+        EffectConfig::Sunset { speed } => {
+            let ts = t * speed;
+            // The sun slowly sinks and rises again; hue shimmers gently along x.
+            let drift = 0.10 * (ts * 0.25).sin();
+            spatial_positions(zone)
+                .into_iter()
+                .map(|(x, y)| {
+                    let g = (y + drift).clamp(0.0, 1.0); // 0 = high sky, 1 = horizon
+                    let hue = 275.0 + g * 115.0 + 6.0 * (x * TAU + ts * 0.4).sin();
+                    let val = 0.45 + 0.55 * g;
+                    Color::from_hsv(hue, 0.95 - 0.2 * g, val)
+                })
+                .collect()
+        }
         // The firmware animates onboard effects on the device itself. We can't
         // phase-sync to it, but the user wants the on-screen preview to MOVE so
         // it reads like the real board. `onboard_frame` is a host approximation
@@ -220,9 +311,54 @@ fn nonspatial_frame(effect: &EffectConfig, n: usize, t: f32) -> Option<Vec<Color
             let v = ts.sin() + (ts * 1.3).sin() + (ts * 0.7).sin();
             Color::from_hsv(v * 60.0 + ts * 40.0, 1.0, 1.0)
         }
+        // Sunset collapses to the palette swept over time: the lamp slowly
+        // travels sky -> horizon and back instead of pinning to one stop.
+        EffectConfig::Sunset { speed } => {
+            let g = 0.5 - 0.5 * (t * speed * 0.25).cos();
+            Color::from_hsv(275.0 + g * 115.0, 0.95 - 0.2 * g, 0.45 + 0.55 * g)
+        }
         _ => return None,
     };
     Some(vec![color; n])
+}
+
+/// Deterministic lightning state at storm-time `ts`: (flash level 0..1, bolt
+/// x-center 0..1). Time is bucketed into ~1.4s slots; a slot may fire one
+/// strike (with a per-slot jitter and column) whose flash flickers as it
+/// decays, so consecutive ticks agree on what's mid-flash.
+fn lightning(ts: f32) -> (f32, f32) {
+    const SLOT: f32 = 1.4;
+    const DUR: f32 = 0.5;
+    let mut flash = 0.0_f32;
+    let mut bolt_x = 0.5_f32;
+    let last = (ts / SLOT).floor() as i64;
+    for s in 0..=1 {
+        let bucket = last - s;
+        let b = bucket as u64;
+        if hash01(b.wrapping_mul(0x1234_5677)) > 0.45 {
+            let jitter = hash01(b.wrapping_mul(0x9E37_79B9)) * (SLOT - DUR);
+            let age = ts - (bucket as f32 * SLOT + jitter);
+            if (0.0..=DUR).contains(&age) {
+                let decay = 1.0 - age / DUR;
+                // 14 Hz flicker so the strike stutters like a real strobe.
+                let f = decay * decay * (0.55 + 0.45 * (age * 88.0).sin().abs());
+                if f > flash {
+                    flash = f;
+                    bolt_x = hash01(b.wrapping_mul(0xDEAD_BEE7));
+                }
+            }
+        }
+    }
+    (flash, bolt_x)
+}
+
+/// Component-wise saturating add (used to layer a flash over a base color).
+fn add_sat(a: Color, b: Color) -> Color {
+    Color {
+        r: a.r.saturating_add(b.r),
+        g: a.g.saturating_add(b.g),
+        b: a.b.saturating_add(b.b),
+    }
 }
 
 /// Cheap deterministic hash of `n` into [0, 1). Used by stateless effects
@@ -397,6 +533,22 @@ fn led_positions(zone: &ZoneInfo) -> Vec<f32> {
     } else {
         (0..n)
             .map(|index| index as f32 / (zone.led_count - 1) as f32)
+            .collect()
+    }
+}
+
+/// (x, y) per LED like `key_positions`, but strips derive y from the LED's
+/// physical height on a fan ring: LED 0 sits at the top of the ring (see the
+/// sim's FanChain: slot angle = pos·τ + π/2), so y = (1 − cos(pos·τ))/2 with
+/// 0 = top — matching the key-matrix convention. Lets vertical effects
+/// (Aurora, Sunset) track real fan orientation instead of a flat 0.5.
+fn spatial_positions(zone: &ZoneInfo) -> Vec<(f32, f32)> {
+    if zone.keys.is_some() {
+        key_positions(zone)
+    } else {
+        led_positions(zone)
+            .into_iter()
+            .map(|p| (p, 0.5 - 0.5 * (p * TAU).cos()))
             .collect()
     }
 }

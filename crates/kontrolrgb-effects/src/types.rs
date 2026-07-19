@@ -168,13 +168,47 @@ pub enum EffectConfig {
     Ripple {
         speed: f32,
     },
+    /// Drifting northern-lights curtains in a teal/green/violet band.
+    Aurora {
+        speed: f32,
+    },
+    /// Bright arcs orbit the zone center — fan rings spin, keyboards get a
+    /// rotating radar sweep.
+    Vortex {
+        color: Color,
+        speed: f32,
+        reverse: bool,
+        /// Number of evenly spaced arcs (1..=4). Defaults so configs built
+        /// from the app's generic color/speed/direction controls stay valid.
+        #[serde(default = "default_vortex_arms")]
+        arms: u32,
+    },
+    /// Double-thump cardiac pulse over a faint resting glow.
+    Heartbeat {
+        color: Color,
+        speed: f32,
+    },
+    /// Near-dark storm blue with deterministic lightning strikes; bolts are
+    /// localized on key matrices, whole-ring flashes on LED strips.
+    Thunderstorm {
+        speed: f32,
+    },
+    /// Vertical dusk gradient (violet high, gold at the horizon) that slowly
+    /// sinks and shimmers. Fan rings map ring height to the gradient.
+    Sunset {
+        speed: f32,
+    },
     /// Firmware-animated effect (hardware runs it; host sets it once).
     Onboard(OnboardEffect),
 }
 
+fn default_vortex_arms() -> u32 {
+    2
+}
+
 impl EffectConfig {
     /// Host-computed effect kinds (used by the mock devices' supported_effects).
-    pub const ALL_KINDS: [&'static str; 13] = [
+    pub const ALL_KINDS: [&'static str; 18] = [
         "static",
         "breathing",
         "rainbow_wave",
@@ -188,6 +222,11 @@ impl EffectConfig {
         "larson",
         "theater_chase",
         "ripple",
+        "aurora",
+        "vortex",
+        "heartbeat",
+        "thunderstorm",
+        "sunset",
     ];
 }
 

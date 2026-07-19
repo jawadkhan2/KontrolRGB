@@ -26,7 +26,12 @@ export type SyncEffectId =
   | "plasma"
   | "larson"
   | "theater_chase"
-  | "ripple";
+  | "ripple"
+  | "aurora"
+  | "vortex"
+  | "heartbeat"
+  | "thunderstorm"
+  | "sunset";
 
 interface PersistedSettings {
   /**

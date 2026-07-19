@@ -643,6 +643,15 @@ body {
 .pv-larson { background: linear-gradient(90deg, transparent 40%, #ff2828 50%, transparent 60%); background-size: 200% 100%; animation: larson 1.4s ease-in-out infinite alternate; }
 .pv-chase { background: repeating-linear-gradient(90deg, var(--seg) 0 20%, transparent 20% 60%); background-size: 30% 100%; animation: stripe 1.2s steps(3) infinite; }
 .pv-ripple { background: radial-gradient(circle, #22d3ee 0 20%, #5b8cff 40%, #0e1218 70%); background-size: 200% 200%; background-position: center; animation: ripple 2s ease-out infinite; }
+.pv-aurora { background: linear-gradient(100deg, #14b8a6, #22c55e, #2dd4bf, #8b5cf6, #14b8a6); background-size: 250% 100%; animation: stripe 4s ease-in-out infinite; }
+.pv-vortex { background: conic-gradient(from var(--va, 0deg), var(--seg) 0 12%, transparent 12% 50%, var(--seg) 50% 62%, transparent 62%), #0e1218; animation: vortexspin 1.6s linear infinite; }
+.pv-heartbeat { background: #ff1e32; animation: heartbeat 1s ease-out infinite; }
+.pv-storm { background: linear-gradient(180deg, #10182e, #081026); animation: storm 2.8s steps(1) infinite; }
+.pv-sunset { background: linear-gradient(180deg, #7c3aed, #ec4899, #f97316, #fbbf24); }
+@property --va { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
+@keyframes vortexspin { to { --va: 360deg; } }
+@keyframes heartbeat { 0%, 55%, 100% { filter: brightness(0.45); } 8% { filter: brightness(1.5); } 20% { filter: brightness(0.6); } 30% { filter: brightness(1.1); } }
+@keyframes storm { 0%, 100% { filter: brightness(1); } 62% { filter: brightness(3.2) saturate(0.4); } 66% { filter: brightness(1.2); } 70% { filter: brightness(2.4) saturate(0.4); } 76% { filter: brightness(1); } }
 @keyframes flicker { 50% { filter: brightness(1.4); } }
 @keyframes twinkle { 50% { filter: brightness(1.6); } }
 @keyframes larson { to { background-position: 100% 0; } }
@@ -700,6 +709,11 @@ body {
 .preview .bar.pv-larson { background: linear-gradient(90deg, transparent 40%, var(--pick, #ff2828) 50%, transparent 60%); background-size: 200% 100%; animation: larson 1.4s ease-in-out infinite alternate; }
 .preview .bar.pv-chase { background: repeating-linear-gradient(90deg, var(--pick, #5b8cff) 0 20%, transparent 20% 60%); background-size: 30% 100%; animation: stripe 1.2s steps(3) infinite; }
 .preview .bar.pv-ripple { background: radial-gradient(circle, #22d3ee 0 20%, #5b8cff 40%, #0e1218 70%); background-size: 200% 200%; background-position: center; animation: ripple 2s ease-out infinite; }
+.preview .bar.pv-aurora { background: linear-gradient(100deg, #14b8a6, #22c55e, #2dd4bf, #8b5cf6, #14b8a6); background-size: 250% 100%; animation: stripe 4s ease-in-out infinite; }
+.preview .bar.pv-vortex { background: conic-gradient(from var(--va, 0deg), var(--pick, #5b8cff) 0 12%, transparent 12% 50%, var(--pick, #5b8cff) 50% 62%, transparent 62%), #0e1218; animation: vortexspin 1.6s linear infinite; }
+.preview .bar.pv-heartbeat { background: var(--pick, #ff1e32); animation: heartbeat 1s ease-out infinite; }
+.preview .bar.pv-storm { background: linear-gradient(180deg, #10182e, #081026); animation: storm 2.8s steps(1) infinite; }
+.preview .bar.pv-sunset { background: linear-gradient(180deg, #7c3aed, #ec4899, #f97316, #fbbf24); }
 
 /* device tiles : click to include / exclude */
 .dev-tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
