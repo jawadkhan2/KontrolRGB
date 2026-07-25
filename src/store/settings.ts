@@ -31,7 +31,12 @@ export type SyncEffectId =
   | "vortex"
   | "heartbeat"
   | "thunderstorm"
-  | "sunset";
+  | "sunset"
+  | "nebula"
+  | "tide"
+  | "cascade"
+  | "neon_noir"
+  | "glacier";
 
 interface PersistedSettings {
   /**

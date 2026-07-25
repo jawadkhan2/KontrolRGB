@@ -257,6 +257,122 @@ pub fn compute_frame(
                 })
                 .collect()
         }
+        EffectConfig::Nebula { speed } => {
+            let ts = t * speed * 0.35;
+            spatial_positions(zone)
+                .into_iter()
+                .enumerate()
+                .map(|(i, (x, y))| {
+                    // Integer x frequencies so the cloud closes seamlessly
+                    // around a fan ring (x wraps 0->1).
+                    let c1 = (x * TAU + ts * 0.9).sin();
+                    let c2 = (x * TAU * 2.0 - ts * 0.55 + y * 3.0).sin();
+                    let c3 = (y * 4.0 + ts * 0.7).sin();
+                    let field = 0.5 + 0.5 * (0.50 * c1 + 0.32 * c2 + 0.18 * c3);
+                    let hue = 188.0 + 142.0 * field; // cyan -> blue -> magenta
+                    // Squared density leaves dark voids between cloud cores.
+                    let dens = 0.10 + 0.90 * field * field;
+                    let base = Color::from_hsv(hue, 0.92 - 0.25 * field, 0.12 + 0.88 * dens);
+                    add_sat(base, starlight(i, t * speed))
+                })
+                .collect()
+        }
+        EffectConfig::Tide { speed } => {
+            let ts = t * speed * 0.5;
+            spatial_positions(zone)
+                .into_iter()
+                .map(|(x, y)| {
+                    // Surface height in zone space (0 = top, 1 = bottom): a slow
+                    // swell plus two travelling ripples so the line isn't flat.
+                    let level = 0.46
+                        + 0.10 * (ts * 0.8).sin()
+                        + 0.055 * (x * TAU + ts * 1.3).sin()
+                        + 0.03 * (x * TAU * 2.0 - ts * 1.9).sin();
+                    let d = y - level; // > 0 = below the surface
+                    let base = if d >= 0.0 {
+                        let depth = (d / 0.55).clamp(0.0, 1.0);
+                        Color::from_hsv(178.0 + 32.0 * depth, 0.80 + 0.18 * depth, 0.85 - 0.62 * depth)
+                    } else {
+                        // Night sky above the water, dimming with altitude.
+                        let up = (-d / 0.30).clamp(0.0, 1.0);
+                        Color::from_hsv(214.0, 0.85, 0.03 + 0.27 * (1.0 - up))
+                    };
+                    let foam = (1.0 - d.abs() / 0.07).max(0.0);
+                    lerp_color(base, Color { r: 225, g: 250, b: 255 }, foam * foam)
+                })
+                .collect()
+        }
+        EffectConfig::Cascade {
+            color,
+            speed,
+            reverse,
+        } => {
+            let ts = t * speed;
+            // A key matrix rains per column. A fan ring has no columns worth the
+            // name (12 LEDs), so it gets a few overlapping drops falling down
+            // the ring's height — both sides of the ring light at the same
+            // height, which is what a drop running down a real fan looks like.
+            let ring = zone.keys.is_none();
+            spatial_positions(zone)
+                .into_iter()
+                .map(|(x, y)| {
+                    let yy = if *reverse { 1.0 - y } else { y };
+                    let level = if ring {
+                        (1..=3).fold(0.0_f32, |acc, k| acc.max(cascade_level(k, yy, ts)))
+                    } else {
+                        cascade_level((x * CASCADE_COLS).floor().max(0.0) as u64 + 1, yy, ts)
+                    };
+                    let lit = color.scale(level * level);
+                    // The leading head burns out toward white.
+                    let hot = ((level - 0.82) / 0.18).max(0.0);
+                    lerp_color(lit, Color { r: 235, g: 255, b: 245 }, hot * hot)
+                })
+                .collect()
+        }
+        EffectConfig::NeonNoir { speed, reverse } => {
+            let dir = if *reverse { -1.0 } else { 1.0 };
+            let ts = t * speed;
+            let scan = (dir * ts * 0.22).rem_euclid(1.0);
+            spatial_positions(zone)
+                .into_iter()
+                .map(|(x, y)| {
+                    // Duotone bed: cyan and magenta poles blended around the
+                    // zone. 185 -> 315 runs through blue/violet, never green.
+                    let mix = 0.5 + 0.5 * (x * TAU - ts * 0.25).sin();
+                    let hue = 185.0 + 130.0 * mix;
+                    let bed = 0.30 - 0.12 * y; // grounded: darker toward the bottom
+                    // Wrapped distance to the scan band, so it crosses a ring
+                    // seam without a hard cut.
+                    let mut d = (x - scan).abs();
+                    if d > 0.5 {
+                        d = 1.0 - d;
+                    }
+                    let glow = (-(d / 0.13) * (d / 0.13)).exp();
+                    Color::from_hsv(hue, 1.0 - 0.55 * glow, (bed + 0.85 * glow).clamp(0.0, 1.0))
+                })
+                .collect()
+        }
+        EffectConfig::Glacier { speed } => {
+            let ts = t * speed * 0.3;
+            let (rim, radius, bx, by) = frost_bloom(t * speed);
+            spatial_positions(zone)
+                .into_iter()
+                .enumerate()
+                .map(|(i, (x, y))| {
+                    let f = 0.5 + 0.5 * (0.6 * (x * TAU + ts).sin() + 0.4 * (y * 3.0 - ts * 0.8).sin());
+                    // Per-LED shimmer: continuous (no discrete sparkle events),
+                    // so the ice breathes instead of strobing.
+                    let sh = 0.5 + 0.5 * (ts * 2.3 + hash01(i as u64) * TAU).sin();
+                    let val = (0.18 + 0.58 * f) * (0.78 + 0.22 * sh);
+                    // Deep glacier blue in the troughs, pale ice at the peaks —
+                    // saturation stays up so it never flattens into plain white.
+                    let base = Color::from_hsv(202.0 + 10.0 * f, 0.95 - 0.35 * f, val);
+                    let dr = ((x - bx) * (x - bx) + (y - by) * (y - by)).sqrt() - radius;
+                    let edge = rim * (-(dr / 0.11) * (dr / 0.11)).exp();
+                    add_sat(base, Color { r: 150, g: 225, b: 255 }.scale(edge))
+                })
+                .collect()
+        }
         // The firmware animates onboard effects on the device itself. We can't
         // phase-sync to it, but the user wants the on-screen preview to MOVE so
         // it reads like the real board. `onboard_frame` is a host approximation
@@ -317,6 +433,54 @@ fn nonspatial_frame(effect: &EffectConfig, n: usize, t: f32) -> Option<Vec<Color
             let g = 0.5 - 0.5 * (t * speed * 0.25).cos();
             Color::from_hsv(275.0 + g * 115.0, 0.95 - 0.2 * g, 0.45 + 0.55 * g)
         }
+        // Nebula: the lamp drifts through the cloud palette over time instead
+        // of pinning to one point of the field.
+        EffectConfig::Nebula { speed } => {
+            let ts = t * speed * 0.35;
+            let field = 0.5 + 0.5 * (0.62 * (ts * 0.9).sin() + 0.38 * (ts * 0.55 + 1.7).sin());
+            Color::from_hsv(188.0 + 142.0 * field, 0.92 - 0.25 * field, 0.25 + 0.75 * field * field)
+        }
+        // Tide: no height on a single lamp, so the swell reads as a teal surge
+        // that crests foam-white at high water.
+        EffectConfig::Tide { speed } => {
+            let s = 0.5 - 0.5 * (t * speed * 0.5 * 0.8).cos();
+            let base = Color::from_hsv(178.0 + 26.0 * (1.0 - s), 0.88, 0.20 + 0.80 * s);
+            lerp_color(base, Color { r: 225, g: 250, b: 255 }, ((s - 0.88) / 0.12).max(0.0))
+        }
+        // Cascade: one drop stream passing = a repeating fall-off pulse.
+        EffectConfig::Cascade { color, speed, .. } => {
+            let level = cascade_level(1, 0.5, t * speed);
+            color.scale(level * level)
+        }
+        // Neon Noir: duotone shift over time, flashing white as the band passes.
+        EffectConfig::NeonNoir { speed, reverse } => {
+            let dir = if *reverse { -1.0 } else { 1.0 };
+            let ts = t * speed;
+            let mix = 0.5 + 0.5 * (ts * 0.25).sin();
+            let scan = (dir * ts * 0.22).rem_euclid(1.0);
+            let mut d = (0.25 - scan).abs();
+            if d > 0.5 {
+                d = 1.0 - d;
+            }
+            let glow = (-(d / 0.09) * (d / 0.09)).exp();
+            Color::from_hsv(
+                185.0 + 130.0 * mix,
+                1.0 - 0.55 * glow,
+                (0.24 + 0.85 * glow).clamp(0.0, 1.0),
+            )
+        }
+        // Glacier: gentle ice glow that brightens as each frost bloom sweeps by.
+        EffectConfig::Glacier { speed } => {
+            let ts = t * speed * 0.3;
+            let f = 0.5 + 0.5 * (ts * 0.9).sin();
+            let (rim, radius, _, _) = frost_bloom(t * speed);
+            let base = Color::from_hsv(202.0 + 10.0 * f, 0.95 - 0.35 * f, 0.22 + 0.55 * f);
+            let dr = 0.45 - radius; // the rim crossing the lamp
+            add_sat(
+                base,
+                Color { r: 150, g: 225, b: 255 }.scale(rim * (-(dr / 0.14) * (dr / 0.14)).exp()),
+            )
+        }
         _ => return None,
     };
     Some(vec![color; n])
@@ -350,6 +514,77 @@ fn lightning(ts: f32) -> (f32, f32) {
         }
     }
     (flash, bolt_x)
+}
+
+/// Sparse deterministic starlight for Nebula: an LED lights rarely and fades
+/// over ~1.6s, so a handful of slow stars blink over the cloud field. Same
+/// bucketed-time trick as Twinkle, tuned much sparser and dimmer.
+fn starlight(i: usize, ts: f32) -> Color {
+    const SLOT: f32 = 0.5;
+    const FADE: f32 = 1.6;
+    let mut best = 0.0_f32;
+    let last = (ts / SLOT).floor() as i64;
+    let steps = (FADE / SLOT).ceil() as i64;
+    for s in 0..=steps {
+        let bucket = last - s;
+        let seed = (bucket as u64).wrapping_mul(0x85EB_CA6B) ^ (i as u64).wrapping_mul(0xC2B2_AE35);
+        if hash01(seed) > 0.94 {
+            let age = ts - bucket as f32 * SLOT;
+            if age >= 0.0 {
+                best = best.max((1.0 - age / FADE).max(0.0));
+            }
+        }
+    }
+    Color { r: 200, g: 220, b: 255 }.scale(best * best * 0.85)
+}
+
+/// Columns a Cascade key matrix rains in.
+const CASCADE_COLS: f32 = 10.0;
+
+/// Lit level 0..1 of one Cascade drop stream at height `y` and rain-time `ts`.
+/// Each stream (`seed`) gets its own fall period and phase offset, so drops
+/// never march in lockstep.
+fn cascade_level(seed: u64, y: f32, ts: f32) -> f32 {
+    const TAIL: f32 = 0.42;
+    let period = 1.7 + 2.3 * hash01(seed.wrapping_mul(0x51ED_2701));
+    let phase = (ts / period + hash01(seed.wrapping_mul(0x27D4_EB2D))).rem_euclid(1.0);
+    // The head travels past both ends so drops enter and leave cleanly.
+    let head = phase * (1.0 + 2.0 * TAIL) - TAIL;
+    let d = y - head; // > 0 = the head hasn't reached this LED yet
+    if d > 0.0 {
+        0.0
+    } else {
+        (1.0 + d / TAIL).max(0.0)
+    }
+}
+
+/// Deterministic Glacier frost bloom at ice-time `ts`: every ~4.2s a crystal
+/// grows from a pseudo-random point, its bright rim expanding outward and
+/// fading. Returns (rim brightness, rim radius, center x, center y).
+fn frost_bloom(ts: f32) -> (f32, f32, f32, f32) {
+    const SLOT: f32 = 4.2;
+    const DUR: f32 = 2.2;
+    let mut out = (0.0_f32, 0.0_f32, 0.5_f32, 0.5_f32);
+    let last = (ts / SLOT).floor() as i64;
+    for s in 0..=1 {
+        let bucket = last - s;
+        let age = ts - bucket as f32 * SLOT;
+        if (0.0..=DUR).contains(&age) {
+            let k = age / DUR;
+            // Fast bloom in, slow fade out.
+            let level = (1.0 - k) * (k * 4.0).min(1.0);
+            if level > out.0 {
+                let b = bucket as u64;
+                out = (
+                    level,
+                    0.05 + k * 0.75,
+                    hash01(b.wrapping_mul(0xA24B_AED4)),
+                    hash01(b.wrapping_mul(0x1B87_3593)),
+                );
+            }
+        }
+    }
+    out
 }
 
 /// Component-wise saturating add (used to layer a flash over a base color).

@@ -198,6 +198,34 @@ pub enum EffectConfig {
     Sunset {
         speed: f32,
     },
+    /// Interstellar cloud field drifting through cyan/violet/magenta, with
+    /// sparse slow-blinking starlight over the top.
+    Nebula {
+        speed: f32,
+    },
+    /// A waterline that swells up and down: lit teal below the surface, a
+    /// bright foam crest at the line, near-dark navy above. Fan rings fill
+    /// from the bottom of the ring.
+    Tide {
+        speed: f32,
+    },
+    /// Rain: drops fall column by column with fading trails and a hot white
+    /// head. Each column runs its own period so the rain never marches in step.
+    Cascade {
+        color: Color,
+        speed: f32,
+        reverse: bool,
+    },
+    /// Magenta/cyan duotone bed with a bright scan band sweeping across it.
+    NeonNoir {
+        speed: f32,
+        reverse: bool,
+    },
+    /// Pale ice field with a slow shimmer and a frost bloom that periodically
+    /// crystallizes outward from a random point.
+    Glacier {
+        speed: f32,
+    },
     /// Firmware-animated effect (hardware runs it; host sets it once).
     Onboard(OnboardEffect),
 }
@@ -208,7 +236,7 @@ fn default_vortex_arms() -> u32 {
 
 impl EffectConfig {
     /// Host-computed effect kinds (used by the mock devices' supported_effects).
-    pub const ALL_KINDS: [&'static str; 18] = [
+    pub const ALL_KINDS: [&'static str; 23] = [
         "static",
         "breathing",
         "rainbow_wave",
@@ -227,6 +255,11 @@ impl EffectConfig {
         "heartbeat",
         "thunderstorm",
         "sunset",
+        "nebula",
+        "tide",
+        "cascade",
+        "neon_noir",
+        "glacier",
     ];
 }
 

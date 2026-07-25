@@ -73,6 +73,11 @@ export type EffectConfig =
   | { kind: "heartbeat"; color: Color; speed: number }
   | { kind: "thunderstorm"; speed: number }
   | { kind: "sunset"; speed: number }
+  | { kind: "nebula"; speed: number }
+  | { kind: "tide"; speed: number }
+  | { kind: "cascade"; color: Color; speed: number; reverse: boolean }
+  | { kind: "neon_noir"; speed: number; reverse: boolean }
+  | { kind: "glacier"; speed: number }
   // Serde flattens the OnboardEffect fields alongside the tag.
   | ({ kind: "onboard" } & OnboardEffect);
 

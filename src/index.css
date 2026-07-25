@@ -648,6 +648,14 @@ body {
 .pv-heartbeat { background: #ff1e32; animation: heartbeat 1s ease-out infinite; }
 .pv-storm { background: linear-gradient(180deg, #10182e, #081026); animation: storm 2.8s steps(1) infinite; }
 .pv-sunset { background: linear-gradient(180deg, #7c3aed, #ec4899, #f97316, #fbbf24); }
+.pv-nebula { background: radial-gradient(circle at 22% 34%, #fff 0 2.5%, transparent 4%), radial-gradient(circle at 68% 66%, #fff 0 2%, transparent 3.5%), linear-gradient(100deg, #0b1026, #4c1d95, #c026d3, #0891b2, #0b1026); background-size: 100% 100%, 100% 100%, 260% 100%; animation: stripe 6s ease-in-out infinite; }
+.pv-tide { background: linear-gradient(180deg, #061428 0 36%, #dffbff 36% 41%, #0891b2 41%, #04202e); background-size: 100% 190%; animation: tideswell 4.2s ease-in-out infinite alternate; }
+.pv-cascade { background: repeating-linear-gradient(180deg, #fff 0 1%, var(--seg) 1.8% 5%, transparent 15% 25%), #070a10; background-size: 100% 200%; animation: cascadefall 1.5s linear infinite; }
+.pv-neonnoir { background: linear-gradient(90deg, transparent 44%, rgba(255, 255, 255, 0.92) 50%, transparent 56%), linear-gradient(90deg, #22d3ee, #7c3aed, #ff2fd0, #7c3aed, #22d3ee); background-size: 240% 100%, 100% 100%; animation: stripe 2.4s linear infinite; }
+.pv-glacier { background: linear-gradient(160deg, #072a4a, #38bdf8, #bae6fd, #0e7490); background-size: 220% 220%; animation: stripe 5s ease-in-out infinite, glacierbloom 4.2s ease-out infinite; }
+@keyframes tideswell { from { background-position: 0 28%; } to { background-position: 0 66%; } }
+@keyframes cascadefall { to { background-position: 0 100%; } }
+@keyframes glacierbloom { 0%, 70%, 100% { filter: brightness(1); } 12% { filter: brightness(1.5) saturate(0.85); } 30% { filter: brightness(1.12); } }
 @property --va { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
 @keyframes vortexspin { to { --va: 360deg; } }
 @keyframes heartbeat { 0%, 55%, 100% { filter: brightness(0.45); } 8% { filter: brightness(1.5); } 20% { filter: brightness(0.6); } 30% { filter: brightness(1.1); } }
@@ -714,6 +722,11 @@ body {
 .preview .bar.pv-heartbeat { background: var(--pick, #ff1e32); animation: heartbeat 1s ease-out infinite; }
 .preview .bar.pv-storm { background: linear-gradient(180deg, #10182e, #081026); animation: storm 2.8s steps(1) infinite; }
 .preview .bar.pv-sunset { background: linear-gradient(180deg, #7c3aed, #ec4899, #f97316, #fbbf24); }
+.preview .bar.pv-nebula { background: radial-gradient(circle at 22% 34%, #fff 0 1%, transparent 1.8%), radial-gradient(circle at 68% 66%, #fff 0 0.8%, transparent 1.5%), linear-gradient(100deg, #0b1026, #4c1d95, #c026d3, #0891b2, #0b1026); background-size: 100% 100%, 100% 100%, 260% 100%; animation: stripe 6s ease-in-out infinite; }
+.preview .bar.pv-tide { background: linear-gradient(180deg, #061428 0 36%, #dffbff 36% 41%, #0891b2 41%, #04202e); background-size: 100% 190%; animation: tideswell 4.2s ease-in-out infinite alternate; }
+.preview .bar.pv-cascade { background: repeating-linear-gradient(180deg, #fff 0 1%, var(--pick, #5b8cff) 1.8% 5%, transparent 15% 25%), #070a10; background-size: 100% 200%; animation: cascadefall 1.5s linear infinite; }
+.preview .bar.pv-neonnoir { background: linear-gradient(90deg, transparent 46%, rgba(255, 255, 255, 0.92) 50%, transparent 54%), linear-gradient(90deg, #22d3ee, #7c3aed, #ff2fd0, #7c3aed, #22d3ee); background-size: 240% 100%, 100% 100%; animation: stripe 2.4s linear infinite; }
+.preview .bar.pv-glacier { background: linear-gradient(160deg, #072a4a, #38bdf8, #bae6fd, #0e7490); background-size: 220% 220%; animation: stripe 5s ease-in-out infinite, glacierbloom 4.2s ease-out infinite; }
 
 /* device tiles : click to include / exclude */
 .dev-tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
