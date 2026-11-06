@@ -19,6 +19,10 @@
 #[cfg(windows)]
 const WAIT_FOR_PID_ARG: &str = "--wait-for-pid=";
 
+/// Passed by the autostart Run entry; see `launched_minimized` in lib.rs.
+#[cfg(windows)]
+const MINIMIZED_ARG: &str = "--minimized";
+
 /// Block until the process we are replacing has exited, so its HID handles, fan
 /// driver and single-instance mutex are all released before we claim them. No-op
 /// unless we were launched with `--wait-for-pid`. Bounded, so a wedged parent
@@ -95,15 +99,25 @@ pub fn relaunch_as_admin() -> Result<(), String> {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
 
     const SW_SHOWNORMAL: i32 = 1;
+    const SW_SHOWMINNOACTIVE: i32 = 7;
 
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
 
+    // A boot launch carries `--minimized`. The "ask to run as administrator on
+    // startup" toggle relaunches us elevated right after boot, so the flag has
+    // to survive the hop — otherwise the elevated instance thinks it was opened
+    // by hand and pops the window up on every sign-in.
+    let minimized = std::env::args().any(|a| a == MINIMIZED_ARG);
+    let mut arg_line = format!("{WAIT_FOR_PID_ARG}{}", std::process::id());
+    if minimized {
+        arg_line.push(' ');
+        arg_line.push_str(MINIMIZED_ARG);
+    }
+
     let wide: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
     let verb: Vec<u16> = "runas".encode_utf16().chain(std::iter::once(0)).collect();
-    let args: Vec<u16> = format!("{WAIT_FOR_PID_ARG}{}", std::process::id())
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let args: Vec<u16> = arg_line.encode_utf16().chain(std::iter::once(0)).collect();
+    let show_cmd = if minimized { SW_SHOWMINNOACTIVE } else { SW_SHOWNORMAL };
 
     // ShellExecuteW returns an HINSTANCE; a value <= 32 means failure (e.g.
     // SE_ERR_ACCESSDENIED when the user clicks "No" on the UAC dialog).
@@ -114,7 +128,7 @@ pub fn relaunch_as_admin() -> Result<(), String> {
             wide.as_ptr(),
             args.as_ptr(),
             std::ptr::null(),
-            SW_SHOWNORMAL,
+            show_cmd,
         )
     };
 

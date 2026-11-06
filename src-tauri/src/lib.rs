@@ -43,8 +43,8 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         // Launch-on-boot. When the OS starts us from the Run key we pass
-        // `--minimized`; the window then stays hidden in the tray (see below).
-        // A manual launch has no such flag, so the window shows normally.
+        // `--minimized`; the window then starts minimized to the taskbar (see
+        // below). A manual launch has no such flag, so the window shows normally.
         .plugin(
             tauri_plugin_autostart::Builder::new()
                 .args(["--minimized"])
@@ -82,11 +82,15 @@ pub fn run() {
             build_tray(app.handle(), app_state.clone())?;
 
             // The window is created hidden (visible: false in tauri.conf.json) so
-            // a boot launch never flashes on screen. Show it now unless we were
-            // started with --minimized (i.e. by the autostart Run entry), in
-            // which case the app lives in the tray until the user clicks it.
+            // a boot launch never flashes on screen. A manual launch shows it
+            // normally. A boot launch (--minimized, from the autostart Run entry
+            // or carried through the admin relaunch) starts minimized to the
+            // taskbar instead: minimize *before* show, so the window goes
+            // straight from hidden to a taskbar button without painting.
             let launched_minimized = std::env::args().any(|a| a == "--minimized");
-            if !launched_minimized {
+            if launched_minimized {
+                start_minimized(app.handle());
+            } else {
                 show_main_window(app.handle());
             }
             Ok(())
@@ -209,6 +213,14 @@ fn wake_recovery(app: &tauri::AppHandle, state: &Arc<AppState>) {
         eprintln!("power-watch: not all devices re-enumerated yet (attempt {attempt}/5)");
     }
     eprintln!("power-watch: gave up waiting for missing devices; use Rescan to retry");
+}
+
+/// Boot launch: put the main window on the taskbar, minimized and unfocused.
+fn start_minimized(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.minimize();
+        let _ = window.show();
+    }
 }
 
 /// Show, unminimize, and focus the main window (used by the tray).
