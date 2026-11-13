@@ -255,7 +255,7 @@ function StartupRow() {
   return (
     <ToggleRow
       title="Start with Windows"
-      description="Launch KontrolRGB automatically when you sign in, minimized to the taskbar. Effects and fan control resume in the background without opening the window."
+      description="Launch KontrolRGB automatically when you sign in, hidden in the system tray. Effects and fan control resume in the background without opening the window."
       checked={ready && enabled}
       onChange={(v) => void onChange(v)}
     />

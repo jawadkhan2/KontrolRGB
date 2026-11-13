@@ -99,14 +99,14 @@ pub fn relaunch_as_admin() -> Result<(), String> {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
 
     const SW_SHOWNORMAL: i32 = 1;
-    const SW_SHOWMINNOACTIVE: i32 = 7;
 
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
 
     // A boot launch carries `--minimized`. The "ask to run as administrator on
     // startup" toggle relaunches us elevated right after boot, so the flag has
     // to survive the hop — otherwise the elevated instance thinks it was opened
-    // by hand and pops the window up on every sign-in.
+    // by hand and pops the window up on every sign-in. With the flag, the
+    // elevated instance keeps its window hidden and sits in the tray.
     let minimized = std::env::args().any(|a| a == MINIMIZED_ARG);
     let mut arg_line = format!("{WAIT_FOR_PID_ARG}{}", std::process::id());
     if minimized {
@@ -117,7 +117,6 @@ pub fn relaunch_as_admin() -> Result<(), String> {
     let wide: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
     let verb: Vec<u16> = "runas".encode_utf16().chain(std::iter::once(0)).collect();
     let args: Vec<u16> = arg_line.encode_utf16().chain(std::iter::once(0)).collect();
-    let show_cmd = if minimized { SW_SHOWMINNOACTIVE } else { SW_SHOWNORMAL };
 
     // ShellExecuteW returns an HINSTANCE; a value <= 32 means failure (e.g.
     // SE_ERR_ACCESSDENIED when the user clicks "No" on the UAC dialog).
@@ -128,7 +127,10 @@ pub fn relaunch_as_admin() -> Result<(), String> {
             wide.as_ptr(),
             args.as_ptr(),
             std::ptr::null(),
-            show_cmd,
+            // Always SW_SHOWNORMAL: the window starts hidden regardless, and a
+            // minimized show hint here would make the first tray-click open
+            // land minimized on the taskbar instead of on screen.
+            SW_SHOWNORMAL,
         )
     };
 
