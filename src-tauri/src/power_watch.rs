@@ -26,6 +26,8 @@ const SETTLE: Duration = Duration::from_millis(2500);
 /// Minimum spacing between recovery runs, so flappy display events (screen
 /// dimming on/off repeatedly) can't rescan in a loop.
 const MIN_GAP: Duration = Duration::from_secs(10);
+/// Display-state events this soon after startup are the registration echo.
+const STARTUP_IGNORE: Duration = Duration::from_secs(5);
 
 /// Start watching. `on_wake` runs on a dedicated thread after each debounced
 /// wake event; it may block (the recovery path sleeps and re-probes).
@@ -39,7 +41,7 @@ pub fn spawn(on_wake: impl Fn() + Send + 'static) {
         .name("power-watch-msg".into())
         .spawn(message_loop)
     {
-        eprintln!("power-watch: failed to spawn message thread: {e}");
+        crate::klog!("power-watch: failed to spawn message thread: {e}");
         return;
     }
 
@@ -47,9 +49,16 @@ pub fn spawn(on_wake: impl Fn() + Send + 'static) {
         .name("power-watch-recover".into())
         .spawn(move || {
             let mut last_run: Option<Instant> = None;
+            let started = Instant::now();
             while rx.recv().is_ok() {
                 // Coalesce the burst until QUIET of silence.
                 while rx.recv_timeout(QUIET).is_ok() {}
+                // Windows delivers the *current* display state as soon as the
+                // notification is registered; that's launch, not a wake, and
+                // the devices were just probed.
+                if started.elapsed() < STARTUP_IGNORE {
+                    continue;
+                }
                 if last_run.is_some_and(|t| t.elapsed() < MIN_GAP) {
                     continue;
                 }
@@ -129,7 +138,7 @@ fn message_loop() {
         wc.hInstance = hinstance;
         wc.lpszClassName = class_name.as_ptr();
         if RegisterClassW(&wc) == 0 {
-            eprintln!("power-watch: RegisterClassW failed");
+            crate::klog!("power-watch: RegisterClassW failed");
             return;
         }
 
@@ -148,7 +157,7 @@ fn message_loop() {
             std::ptr::null(),
         );
         if hwnd.is_null() {
-            eprintln!("power-watch: CreateWindowExW failed");
+            crate::klog!("power-watch: CreateWindowExW failed");
             return;
         }
 
@@ -158,12 +167,12 @@ fn message_loop() {
         // HPOWERNOTIFY is an isize handle in windows-sys; 0 = failure.
         let reg = RegisterPowerSettingNotification(hwnd, &GUID_CONSOLE_DISPLAY_STATE, 0);
         if reg == 0 {
-            eprintln!("power-watch: RegisterPowerSettingNotification (console) failed");
+            crate::klog!("power-watch: RegisterPowerSettingNotification (console) failed");
             // Keep running: plain suspend/resume broadcasts still arrive.
         }
         let reg = RegisterPowerSettingNotification(hwnd, &GUID_SESSION_DISPLAY_STATUS, 0);
         if reg == 0 {
-            eprintln!("power-watch: RegisterPowerSettingNotification (session) failed");
+            crate::klog!("power-watch: RegisterPowerSettingNotification (session) failed");
         }
 
         let mut msg: MSG = std::mem::zeroed();

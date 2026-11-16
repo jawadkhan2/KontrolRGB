@@ -1,6 +1,16 @@
 //! ~30 fps tick loop: computes frames for every device zone, pushes them
 //! through the RgbDevice trait, and mirrors them to the frontend at ~15 fps
 //! via `device-frame` events.
+//!
+//! Efficiency rules:
+//! - preview frames are only emitted while the window is visible (a hidden
+//!   webview has nobody to show them to, and each one is a JSON serialise +
+//!   IPC hop);
+//! - with the window hidden and every effect time-invariant (Static, Custom,
+//!   firmware Onboard) the loop only does real work every `IDLE_EVERY` ticks;
+//! - device info is borrowed, never cloned per tick.
+//!
+//! Lock order (crate-wide): manager → runtime → identify → zone_names → stale.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -24,12 +34,23 @@ struct FramePayload {
 /// its configured effect.
 const IDENTIFY_SECS: f32 = 4.0;
 
+/// Hidden window + only static effects: do a pass every this many ticks
+/// (~4 Hz) instead of every tick. Still fast enough to react to a resync.
+const IDLE_EVERY: u64 = 8;
+
 /// White brightness pulse for the identify animation. `elapsed` is seconds
 /// since the pulse started; pulses at ~1.5 Hz, dark -> bright -> dark.
 fn identify_color(elapsed: f32) -> Color {
     let s = 0.5 - 0.5 * (elapsed * std::f32::consts::TAU * 1.5).cos();
     let v = (s * 255.0) as u8;
     Color { r: v, g: v, b: v }
+}
+
+fn time_invariant(effect: &EffectConfig) -> bool {
+    matches!(
+        effect,
+        EffectConfig::Static { .. } | EffectConfig::Custom | EffectConfig::Onboard(_)
+    )
 }
 
 pub async fn run(app: AppHandle, state: Arc<AppState>) {
@@ -46,35 +67,49 @@ pub async fn run(app: AppHandle, state: Arc<AppState>) {
     loop {
         interval.tick().await;
         tick += 1;
-        let t = start.elapsed().as_secs_f32();
-        let emit_this_tick = tick.is_multiple_of(2);
-        let mut payloads: Vec<FramePayload> = Vec::new();
+        let ui_visible = state.ui_visible.load(Ordering::Relaxed);
         let device_generation = state.device_generation.load(Ordering::Relaxed);
+        let generation_changed = device_generation != seen_device_generation;
+
+        if !ui_visible && !generation_changed && !tick.is_multiple_of(IDLE_EVERY) {
+            let idle = {
+                let runtime = state.runtime.lock();
+                runtime.values().all(|rt| time_invariant(&rt.effect))
+            } && state.identify.lock().is_empty();
+            if idle {
+                continue;
+            }
+        }
+
+        let t = start.elapsed().as_secs_f32();
+        let emit_this_tick = ui_visible && tick.is_multiple_of(2);
+        let mut payloads: Vec<FramePayload> = Vec::new();
         let hw_enabled = state.conflicts_cleared.load(Ordering::Relaxed);
-        if device_generation != seen_device_generation {
+        if generation_changed {
             last_frames.clear();
             last_onboard.clear();
             seen_device_generation = device_generation;
         }
 
         {
+            let mut manager = state.manager.lock();
             let runtime = state.runtime.lock();
             let mut identify = state.identify.lock();
             // Drop expired pulses so they stop overriding their zone.
             identify.retain(|_, (_, started)| started.elapsed().as_secs_f32() < IDENTIFY_SECS);
-            let mut manager = state.manager.lock();
 
             for device in manager.iter_mut() {
+                // --- Phase 1: compute, borrowing the device's info. ---
                 let info = device.info();
                 let Some(rt) = runtime.get(&info.id) else {
                     continue;
                 };
+                let device_id = info.id.clone();
                 let brightness = rt.brightness as f32 / 100.0;
-                let mut payload_zones: HashMap<String, Vec<Color>> = HashMap::new();
 
                 // Active identify pulse for this device (zone id + its color now).
                 let identify_zone: Option<(&str, Color)> =
-                    identify.get(&info.id).map(|(z, started)| {
+                    identify.get(&device_id).map(|(z, started)| {
                         (z.as_str(), identify_color(started.elapsed().as_secs_f32()))
                     });
 
@@ -87,33 +122,49 @@ pub async fn run(app: AppHandle, state: Arc<AppState>) {
                     && info.supported_effects.iter().any(|s| s == "onboard")
                     && identify_zone.is_none();
 
-                if onboard_hw {
-                    last_frames.remove(&info.id);
-                    if let EffectConfig::Onboard(e) = &rt.effect {
-                        let key = (*e, rt.brightness);
-                        if hw_enabled && last_onboard.get(&info.id) != Some(&key) {
-                            match device.set_onboard_effect(e, rt.brightness) {
-                                Ok(()) => {
-                                    last_onboard.insert(info.id.clone(), key);
-                                }
-                                Err(err) => {
-                                    eprintln!("set_onboard_effect {}: {err}", info.id)
-                                }
-                            }
-                        }
-                    }
-                    if emit_this_tick {
-                        for zone in &info.zones {
+                let frames: Vec<(String, Vec<Color>)> = if onboard_hw && !emit_this_tick {
+                    Vec::new()
+                } else {
+                    info.zones
+                        .iter()
+                        .map(|zone| {
                             let mut frame =
                                 super::compute_frame(&rt.effect, zone, &rt.custom_colors, t);
                             for c in frame.iter_mut() {
                                 *c = c.scale(brightness);
                             }
-                            payload_zones.insert(zone.id.clone(), frame);
+                            // Identify pulse overrides the zone's frame (full
+                            // brightness, ignoring the configured effect).
+                            if let Some((zid, color)) = identify_zone {
+                                if zid == zone.id {
+                                    frame.iter_mut().for_each(|c| *c = color);
+                                }
+                            }
+                            (zone.id.clone(), frame)
+                        })
+                        .collect()
+                };
+
+                // --- Phase 2: write (needs &mut device). ---
+                if onboard_hw {
+                    last_frames.remove(&device_id);
+                    if let EffectConfig::Onboard(e) = &rt.effect {
+                        let key = (*e, rt.brightness);
+                        if hw_enabled && last_onboard.get(&device_id) != Some(&key) {
+                            match device.set_onboard_effect(e, rt.brightness) {
+                                Ok(()) => {
+                                    last_onboard.insert(device_id.clone(), key);
+                                }
+                                Err(err) => {
+                                    crate::klog!("set_onboard_effect {device_id}: {err}")
+                                }
+                            }
                         }
+                    }
+                    if emit_this_tick {
                         payloads.push(FramePayload {
-                            device_id: info.id,
-                            zones: payload_zones,
+                            device_id,
+                            zones: frames.into_iter().collect(),
                         });
                     }
                     continue;
@@ -121,56 +172,41 @@ pub async fn run(app: AppHandle, state: Arc<AppState>) {
 
                 // Host path: per-key streaming (Static/Custom on GMMK; all
                 // effects on mock devices, which host-simulate Onboard too).
-                last_onboard.remove(&info.id);
-                let device_last = last_frames.entry(info.id.clone()).or_default();
+                last_onboard.remove(&device_id);
+                let device_last = last_frames.entry(device_id.clone()).or_default();
                 let mut any_changed = false;
 
-                for zone in &info.zones {
-                    let mut frame = super::compute_frame(&rt.effect, zone, &rt.custom_colors, t);
-                    for c in frame.iter_mut() {
-                        *c = c.scale(brightness);
-                    }
-
-                    // Identify pulse overrides the zone's frame (full brightness,
-                    // ignoring the configured effect) so it's unmistakable.
-                    if let Some((zid, color)) = identify_zone {
-                        if zid == zone.id {
-                            frame.iter_mut().for_each(|c| *c = color);
-                        }
-                    }
-
-                    let unchanged = device_last.get(&zone.id) == Some(&frame);
+                for (zone_id, frame) in &frames {
+                    let unchanged = device_last.get(zone_id) == Some(frame);
                     if !unchanged && hw_enabled {
                         // Cache only on success — a failed write must be retried
                         // next tick, not remembered as if it reached the hardware.
-                        match device.set_zone_leds(&zone.id, &frame) {
+                        match device.set_zone_leds(zone_id, frame) {
                             Ok(()) => {
-                                device_last.insert(zone.id.clone(), frame.clone());
+                                device_last.insert(zone_id.clone(), frame.clone());
                                 any_changed = true;
                             }
                             Err(e) => {
-                                eprintln!("set_zone_leds {}/{}: {e}", info.id, zone.id)
+                                crate::klog!("set_zone_leds {device_id}/{zone_id}: {e}")
                             }
                         }
                     }
-                    if emit_this_tick {
-                        payload_zones.insert(zone.id.clone(), frame);
-                    }
                 }
 
-                // Static/Custom effects idle at zero hardware writes.
+                // Static/Custom effects idle at zero hardware writes (the MSI
+                // writer's own heartbeat keeps the board honest).
                 if any_changed {
                     if let Err(e) = device.apply() {
-                        eprintln!("apply {}: {e}", info.id);
+                        crate::klog!("apply {device_id}: {e}");
                         // Forget this device's cached frames so the whole frame
                         // is re-staged and re-applied next tick.
-                        last_frames.remove(&info.id);
+                        last_frames.remove(&device_id);
                     }
                 }
                 if emit_this_tick {
                     payloads.push(FramePayload {
-                        device_id: info.id,
-                        zones: payload_zones,
+                        device_id,
+                        zones: frames.into_iter().collect(),
                     });
                 }
             }

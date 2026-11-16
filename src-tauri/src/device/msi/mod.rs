@@ -1,21 +1,28 @@
 //! MSI MAG Z890 Tomahawk backend (M3) — ARGB fans on the JARGB_V2 headers.
 //!
-//! The MSI 761 direct protocol is plain HID feature reports (one ~727-byte
-//! packet per header per frame), so unlike the GMMK there's no throughput wall
-//! and no writer thread: `apply()` writes the headers inline. The board can
-//! silently leave direct mode on a failed write, so a failed frame re-sends the
-//! 0x50 setup and retries once.
+//! The MSI 761 direct protocol is plain HID feature reports: one 290-byte 0x50
+//! setup arms direct mode, then one ~727-byte 0x51 packet per header per frame.
+//! A dedicated writer thread owns the HID handle; `apply()` only stages and
+//! signals, so the effects engine never blocks on USB.
 //!
-//! Onboard board RGB is out of scope here (still mock); only JARGB_V2_1/2/3
-//! are driven, mapped to MSI header indices 0, 1, and 2.
+//! Keeping control is the hard part. The board can lose direct mode at any time
+//! — monitor sleep, S3 resume, or another program (MSI's LED keeper) re-applying
+//! its own effect — and when it does, 0x51 writes still *succeed* and are simply
+//! ignored. So the writer runs a heartbeat that reads the live setup back
+//! (`direct_mode_active`) and re-arms the moment it differs, plus a reconnect
+//! path for when Windows re-enumerates the controller and the handle dies. The
+//! device object itself is never torn down for this; it heals in place.
+//!
+//! Onboard board RGB is out of scope here; only JARGB_V2_1/2/3 are driven,
+//! mapped to MSI header indices 0, 1, and 2.
 
 pub mod controller;
 pub mod watchdog;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::thread;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
@@ -27,6 +34,11 @@ use super::{DeviceError, RgbDevice};
 
 /// Default LED count per header until the user resizes to the real fan chain.
 const DEFAULT_LEDS: u32 = 16;
+
+/// Stable device id (also used by the manager to recognise a known board).
+pub fn device_id() -> String {
+    format!("msi-{:04x}-{:04x}", controller::VID, controller::PID)
+}
 
 /// (zone id, display name, MSI header index hdr1).
 const HEADERS: [(&str, &str, u8); 3] = [
@@ -40,12 +52,16 @@ pub struct MsiDevice {
     shared: Arc<Shared>,
     /// zone id -> staged colors (committed to hardware on apply()).
     staged: HashMap<String, Vec<Color>>,
+    worker: Option<JoinHandle<()>>,
 }
 
 struct WorkerState {
     frame: HashMap<String, Vec<Color>>,
     generation: u64,
     stop: bool,
+    /// Set by `resync()` (wake / display-on / conflict cleanup): re-send the
+    /// direct-mode setup and the current frame on the next pass, no questions.
+    force_rearm: bool,
 }
 
 struct Shared {
@@ -65,7 +81,9 @@ struct WriteGuard {
     cur_io_start_ms: AtomicU64,
     next_seq: AtomicU64,
     writer_thread: AtomicIsize,
-    stop: std::sync::atomic::AtomicBool,
+    stop: AtomicBool,
+    /// The watchdog thread, so `io_begin` can wake it from its idle park.
+    watchdog: OnceLock<thread::Thread>,
 }
 
 impl WriteGuard {
@@ -76,7 +94,8 @@ impl WriteGuard {
             cur_io_start_ms: AtomicU64::new(0),
             next_seq: AtomicU64::new(0),
             writer_thread: AtomicIsize::new(0),
-            stop: std::sync::atomic::AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            watchdog: OnceLock::new(),
         }
     }
 
@@ -86,31 +105,39 @@ impl WriteGuard {
         self.cur_io_start_ms
             .store(self.base.elapsed().as_millis() as u64, Ordering::Relaxed);
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        self.cur_io_seq.store(seq, Ordering::Relaxed);
+        self.cur_io_seq.store(seq, Ordering::Release);
+        if let Some(t) = self.watchdog.get() {
+            t.unpark();
+        }
     }
 
     fn io_end(&self) {
-        self.cur_io_seq.store(0, Ordering::Relaxed);
+        self.cur_io_seq.store(0, Ordering::Release);
     }
 }
 
 /// How long a single HID feature-report write may block before the watchdog
 /// aborts it. Normal writes are ~12ms; a dropped report otherwise blocks for the
-/// ~5s Windows HID timeout. Cancelling at 150ms turns that freeze into a hiccup.
+/// ~5s Windows HID timeout.
 const WRITE_TIMEOUT_MS: u64 = 150;
 
 /// Watchdog loop: abort the writer's in-flight HID I/O once it has been pending
-/// past `WRITE_TIMEOUT_MS`, at most once per I/O.
+/// past `WRITE_TIMEOUT_MS`, at most once per I/O. Parks while no I/O is in
+/// flight (woken by `io_begin`), so an idle board costs no periodic wakeups.
 fn watchdog_loop(guard: Arc<WriteGuard>) {
     let mut last_cancelled = 0u64;
     loop {
-        thread::sleep(Duration::from_millis(25));
         if guard.stop.load(Ordering::Relaxed) {
             return;
         }
-        let seq = guard.cur_io_seq.load(Ordering::Relaxed);
+        let seq = guard.cur_io_seq.load(Ordering::Acquire);
         if seq == 0 || seq == last_cancelled {
+            thread::park_timeout(Duration::from_secs(1));
             continue;
+        }
+        thread::sleep(Duration::from_millis(25));
+        if guard.cur_io_seq.load(Ordering::Acquire) != seq {
+            continue; // finished in time
         }
         let now = guard.base.elapsed().as_millis() as u64;
         let started = guard.cur_io_start_ms.load(Ordering::Relaxed);
@@ -118,9 +145,10 @@ fn watchdog_loop(guard: Arc<WriteGuard>) {
             let h = guard.writer_thread.load(Ordering::Relaxed);
             watchdog::cancel_sync_io(h);
             last_cancelled = seq;
-            eprintln!(
+            crate::klog!(
                 "msi-watchdog: HID write stuck >{}ms (seq {}), cancelled sync I/O",
-                WRITE_TIMEOUT_MS, seq
+                WRITE_TIMEOUT_MS,
+                seq
             );
         }
     }
@@ -153,7 +181,7 @@ pub fn probe() -> Result<Option<MsiDevice>, DeviceError> {
         .collect();
 
     let info = DeviceInfo {
-        id: format!("msi-{:04x}-{:04x}", controller::VID, controller::PID),
+        id: device_id(),
         name: "MSI MAG Z890 Tomahawk".to_string(),
         device_type: DeviceType::Motherboard,
         zones,
@@ -165,12 +193,13 @@ pub fn probe() -> Result<Option<MsiDevice>, DeviceError> {
             frame: staged.clone(),
             generation: 0,
             stop: false,
+            force_rearm: false,
         }),
         cond: Condvar::new(),
     });
 
     let worker_shared = shared.clone();
-    thread::Builder::new()
+    let worker = thread::Builder::new()
         .name("msi-writer".to_string())
         .spawn(move || worker(ctl, worker_shared))
         .map_err(|e| DeviceError::Comm(e.to_string()))?;
@@ -179,6 +208,7 @@ pub fn probe() -> Result<Option<MsiDevice>, DeviceError> {
         info,
         shared,
         staged,
+        worker: Some(worker),
     }))
 }
 
@@ -194,25 +224,40 @@ const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(50);
 /// which kills the old HID handle for good — no write on it will ever succeed
 /// again, so re-arming direct mode isn't enough; only a fresh open recovers.
 const RECONNECT_AFTER_FAILURES: u32 = 3;
-/// Between reconnect attempts, this many more failed frames must pass (each
-/// failure sleeps 500ms, so attempts land roughly every 2s). Re-opening
-/// enumerates the whole HID tree; don't hammer it.
-const RECONNECT_EVERY_FAILURES: u32 = 4;
 
-/// Idle heartbeat: with a static effect the engine goes silent (its frame cache
-/// skips redundant writes), so nothing would ever notice the MCU reverting to
-/// its firmware rainbow after monitor sleep. Rewriting the last frame this
-/// often heals that: if the MCU dropped direct mode the write fails, which
-/// triggers the re-arm/reconnect paths below. The steady feature-report
-/// traffic also keeps Windows from selective-suspending the controller while
-/// the display is off.
+/// Idle heartbeat. Every beat the writer reads the board's live setup back; if
+/// it left direct mode (firmware reset after sleep, or other software took it)
+/// the setup is re-sent. Then the current frame is rewritten, which also keeps
+/// Windows from selective-suspending the controller while the display is off.
+/// Cost: one 290-byte read + three 727-byte writes every 3s.
 const HEARTBEAT: Duration = Duration::from_secs(3);
+
+/// Back-off between retries while the controller is unreachable: quick at
+/// first, then capped so a long-absent board isn't hammered with enumerations.
+fn retry_delay(failures: u32) -> Duration {
+    Duration::from_millis(match failures {
+        0..=3 => 500,
+        4..=10 => 2_000,
+        _ => 5_000,
+    })
+}
+
+/// Log the first few failures of a streak, then every 50th, so an unplugged or
+/// dead controller can't flood the log file.
+fn should_log(failures: u32) -> bool {
+    failures <= 3 || failures.is_multiple_of(50)
+}
 
 fn worker(mut ctl: MsiController, shared: Arc<Shared>) {
     let mut seen_generation = 0u64;
     let mut pending_retry = false;
     let mut consecutive_failures = 0u32;
-    let mut last_write = std::time::Instant::now();
+    let mut last_write = Instant::now();
+    // Read-back is trusted until a re-arm fails to make it match (some future
+    // firmware might normalise bytes); then we fall back to blind rewrites
+    // rather than re-arming every heartbeat.
+    let mut readback_trusted = true;
+    let mut last_verify = Instant::now();
 
     // Spawn the watchdog that aborts a HID write the MCU stalls on (~5s freeze).
     let guard = Arc::new(WriteGuard::new());
@@ -221,27 +266,37 @@ fn worker(mut ctl: MsiController, shared: Arc<Shared>) {
         .store(watchdog::current_thread_handle(), Ordering::Relaxed);
     {
         let wg = guard.clone();
-        let _ = thread::Builder::new()
+        if let Ok(h) = thread::Builder::new()
             .name("msi-watchdog".to_string())
-            .spawn(move || watchdog_loop(wg));
+            .spawn(move || watchdog_loop(wg))
+        {
+            let _ = guard.watchdog.set(h.thread().clone());
+        }
     }
 
     loop {
-        // Block until the engine has a newer frame (or we owe a retry / must
-        // stop). A HEARTBEAT timeout falls through to rewrite the last frame.
-        {
+        // Block until the engine has a newer frame, a resync was requested, we
+        // owe a retry, or the heartbeat is due.
+        let (heartbeat, rearm) = {
             let mut st = shared.state.lock();
-            while !st.stop && st.generation == seen_generation && !pending_retry {
+            let mut heartbeat = false;
+            while !st.stop && st.generation == seen_generation && !pending_retry && !st.force_rearm
+            {
                 if shared.cond.wait_for(&mut st, HEARTBEAT).timed_out() {
+                    heartbeat = true;
                     break;
                 }
             }
             if st.stop {
                 guard.stop.store(true, Ordering::Relaxed);
+                if let Some(t) = guard.watchdog.get() {
+                    t.unpark();
+                }
                 watchdog::close_handle(guard.writer_thread.load(Ordering::Relaxed));
                 return;
             }
-        }
+            (heartbeat, std::mem::take(&mut st.force_rearm))
+        };
 
         // Rate cap: keep writes >= MIN_FRAME_INTERVAL apart. The engine keeps
         // advancing generations during this sleep; we grab the freshest one
@@ -257,42 +312,86 @@ fn worker(mut ctl: MsiController, shared: Arc<Shared>) {
             st.frame.clone()
         };
 
-        last_write = std::time::Instant::now();
-        match write_frame(&ctl, &guard, &frame) {
-            Ok(_rearms) => {
+        last_write = Instant::now();
+        let result = (|| -> Result<(), DeviceError> {
+            if rearm {
+                crate::klog!("msi: resync requested — re-arming direct mode");
+                guarded(&guard, || ctl.send_setup())?;
+            } else if (heartbeat || last_verify.elapsed() >= HEARTBEAT)
+                && readback_trusted
+                && {
+                    // Time-based, not just on idle timeouts: an animated
+                    // effect keeps the condvar busy and would otherwise never
+                    // get its direct-mode check.
+                    last_verify = Instant::now();
+                    !guarded(&guard, || ctl.direct_mode_active())?
+                }
+            {
+                crate::klog!(
+                    "msi: board left direct mode (sleep/firmware reset or other RGB software) — re-arming"
+                );
+                guarded(&guard, || ctl.send_setup())?;
+                if !guarded(&guard, || ctl.direct_mode_active())? {
+                    readback_trusted = false;
+                    crate::klog!(
+                        "msi: setup read-back still differs after re-arm; disabling read-back checks"
+                    );
+                }
+            }
+            write_frame(&ctl, &guard, &frame).map(|_| ())
+        })();
+
+        match result {
+            Ok(()) => {
+                if consecutive_failures > 0 {
+                    crate::klog!("msi: recovered after {consecutive_failures} failed attempts");
+                }
                 pending_retry = false;
                 consecutive_failures = 0;
             }
             Err(e) => {
                 pending_retry = true;
                 consecutive_failures += 1;
-                eprintln!("msi: frame write failed ({consecutive_failures} in a row): {e}");
-                if consecutive_failures >= RECONNECT_AFTER_FAILURES
-                    && (consecutive_failures - RECONNECT_AFTER_FAILURES)
-                        .is_multiple_of(RECONNECT_EVERY_FAILURES)
-                {
+                if should_log(consecutive_failures) {
+                    crate::klog!("msi: frame write failed ({consecutive_failures} in a row): {e}");
+                }
+                if consecutive_failures >= RECONNECT_AFTER_FAILURES {
                     match MsiController::open() {
-                        Ok(Some(new_ctl)) => {
-                            match guarded(&guard, || new_ctl.send_setup()) {
-                                Ok(()) => {
-                                    eprintln!(
-                                        "msi: controller re-opened after {consecutive_failures} failed frames"
-                                    );
-                                    ctl = new_ctl;
-                                    consecutive_failures = 0;
-                                    // Rewrite the latest frame right away.
-                                    continue;
+                        Ok(Some(new_ctl)) => match guarded(&guard, || new_ctl.send_setup()) {
+                            Ok(()) => {
+                                crate::klog!(
+                                    "msi: controller re-opened after {consecutive_failures} failed frames"
+                                );
+                                ctl = new_ctl;
+                                readback_trusted = true;
+                                // Next pass rewrites the latest frame at once.
+                                continue;
+                            }
+                            Err(e) => {
+                                if should_log(consecutive_failures) {
+                                    crate::klog!("msi: reconnect setup failed: {e}")
                                 }
-                                Err(e) => eprintln!("msi: reconnect setup failed: {e}"),
+                            }
+                        },
+                        Ok(None) => {
+                            if should_log(consecutive_failures) {
+                                crate::klog!("msi: reconnect: controller not enumerated (yet)")
                             }
                         }
-                        Ok(None) => {
-                            eprintln!("msi: reconnect: controller not enumerated (yet)")
+                        Err(e) => {
+                            if should_log(consecutive_failures) {
+                                crate::klog!("msi: reconnect failed: {e}")
+                            }
                         }
-                        Err(e) => eprintln!("msi: reconnect failed: {e}"),
                     }
                 }
-                thread::sleep(Duration::from_millis(500));
+                // Sleep on the condvar so a stop/resync still lands promptly.
+                let mut st = shared.state.lock();
+                if !st.stop && !st.force_rearm {
+                    shared
+                        .cond
+                        .wait_for(&mut st, retry_delay(consecutive_failures));
+                }
             }
         }
     }
@@ -363,8 +462,8 @@ impl RgbDevice for MsiDevice {
         &self.info.id
     }
 
-    fn info(&self) -> DeviceInfo {
-        self.info.clone()
+    fn info(&self) -> &DeviceInfo {
+        &self.info
     }
 
     fn set_zone_leds(&mut self, zone_id: &str, colors: &[Color]) -> Result<(), DeviceError> {
@@ -379,7 +478,7 @@ impl RgbDevice for MsiDevice {
 
     fn apply(&mut self) -> Result<(), DeviceError> {
         let mut st = self.shared.state.lock();
-        st.frame = self.staged.clone();
+        st.frame.clone_from(&self.staged);
         st.generation += 1;
         drop(st);
         self.shared.cond.notify_one();
@@ -408,13 +507,25 @@ impl RgbDevice for MsiDevice {
             .insert(zone_id.to_string(), vec![Color::BLACK; led_count as usize]);
         Ok(())
     }
+
+    fn resync(&mut self) {
+        self.shared.state.lock().force_rearm = true;
+        self.shared.cond.notify_one();
+    }
 }
 
 impl Drop for MsiDevice {
     fn drop(&mut self) {
-        let mut st = self.shared.state.lock();
-        st.stop = true;
-        drop(st);
+        {
+            let mut st = self.shared.state.lock();
+            st.stop = true;
+        }
         self.shared.cond.notify_one();
+        // Wait for the writer to let go of the HID handle, so a re-probe right
+        // after this never has two writers on the board at once. Bounded by the
+        // HID write timeout in the worst case.
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
     }
 }

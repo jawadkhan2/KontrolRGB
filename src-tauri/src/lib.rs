@@ -4,6 +4,7 @@ mod device;
 mod effects;
 mod fan;
 mod gpu_telemetry;
+mod logging;
 mod persistence;
 #[cfg(windows)]
 mod power_watch;
@@ -22,6 +23,7 @@ use state::AppState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    logging::init();
     // If we were spawned by our own "relaunch as admin", the old unelevated
     // process still owns the HID handles, the fan driver and the single-instance
     // mutex. Block until it's gone before we touch any of it.
@@ -67,7 +69,12 @@ pub fn run() {
             if let Ok(dir) = handle.path().app_data_dir() {
                 app_state.fan.init_recovery(dir.join("fan_manual.lock"));
             }
+            // Conflict guard runs its first pass right away (before the engine
+            // has anything to write), so a boot launch with no visible window
+            // still clears competing RGB/fan software and enables hardware.
+            process_guard::spawn_enforcer(handle.clone(), app_state.clone());
             tauri::async_runtime::spawn(effects::engine::run(handle.clone(), app_state.clone()));
+            spawn_device_watch(handle.clone(), app_state.clone());
             tauri::async_runtime::spawn(persistence::run_saver(handle, app_state.clone()));
 
             // Monitor sleep / system suspend resets the USB RGB controllers
@@ -101,6 +108,11 @@ pub fn run() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
+                if let Some(state) = window.try_state::<Arc<AppState>>() {
+                    state
+                        .ui_visible
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -132,6 +144,10 @@ pub fn run() {
             commands::gpu_telemetry,
             commands::scan_rgb_conflicts,
             commands::kill_rgb_conflicts,
+            commands::ack_rgb_conflicts,
+            commands::get_guard_config,
+            commands::set_guard_config,
+            commands::open_log_folder,
             commands::quit_app,
             commands::is_elevated,
             commands::relaunch_as_admin,
@@ -179,39 +195,43 @@ fn build_tray(app: &tauri::AppHandle, state: Arc<AppState>) -> tauri::Result<()>
     Ok(())
 }
 
-/// Wake-from-sleep recovery: re-probe all RGB hardware so dead HID handles are
-/// replaced and direct mode is re-armed; the engine's generation bump then
-/// re-pushes every device's configured effect. USB re-enumeration can lag the
-/// wake event — if a device that was real before the rescan comes back as a
-/// mock, wait and retry a few times before giving up.
+/// Wake / display-on recovery. Deliberately *non-destructive*: working devices
+/// are never torn down (a transient probe failure used to swap the board for a
+/// mock permanently). Instead every device is told to re-assert its state — the
+/// MSI writer re-arms direct mode, the keyboard repaints, the GPU re-sends its
+/// colour — and the fan loop re-applies its duties (the Super-I/O drops manual
+/// mode across S3). Backends whose USB handle died reconnect on their own; any
+/// slot that is still a mock gets a few re-probe attempts while USB settles.
 #[cfg(windows)]
 fn wake_recovery(app: &tauri::AppHandle, state: &Arc<AppState>) {
-    use std::collections::HashSet;
+    crate::klog!("power-watch: wake/display-on — resyncing RGB devices and fan control");
+    state.request_resync();
+    state.fan.on_resume();
 
-    eprintln!("power-watch: wake detected, re-probing RGB hardware");
-    let real_before: HashSet<String> = state
-        .manager
-        .lock()
-        .infos()
-        .into_iter()
-        .map(|i| i.id)
-        .filter(|id| !id.starts_with("mock-"))
-        .collect();
-
-    for attempt in 1..=5 {
-        if attempt > 1 {
+    for attempt in 0..5 {
+        if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_secs(3));
         }
-        let after: HashSet<String> = commands::rescan_and_notify(app, state)
-            .into_iter()
-            .map(|i| i.id)
-            .collect();
-        if real_before.iter().all(|id| after.contains(id)) {
+        if state.manager.lock().missing_slots().is_empty() {
             return;
         }
-        eprintln!("power-watch: not all devices re-enumerated yet (attempt {attempt}/5)");
+        commands::retry_missing_devices(app, state, true);
     }
-    eprintln!("power-watch: gave up waiting for missing devices; use Rescan to retry");
+}
+
+/// Background hot-plug watcher: every `DEVICE_WATCH_EVERY`, re-probe slots that
+/// are on a mock but whose real hardware this user has saved config for. This
+/// is what brings a board/keyboard back if it was missing at boot or after a
+/// manual rescan, with no user action and no wake event required.
+const DEVICE_WATCH_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+
+fn spawn_device_watch(app: tauri::AppHandle, state: Arc<AppState>) {
+    let _ = std::thread::Builder::new()
+        .name("device-watch".into())
+        .spawn(move || loop {
+            std::thread::sleep(DEVICE_WATCH_EVERY);
+            commands::retry_missing_devices(&app, &state, true);
+        });
 }
 
 /// Show, unminimize, and focus the main window (used by the tray).
@@ -220,5 +240,10 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+        if let Some(state) = app.try_state::<Arc<AppState>>() {
+            state
+                .ui_visible
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }

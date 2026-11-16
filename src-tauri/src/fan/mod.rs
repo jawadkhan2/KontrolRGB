@@ -86,6 +86,21 @@ const EMERGENCY_CLEAR_C: f32 = 85.0;
 #[cfg(windows)]
 const CURVE_HYSTERESIS_C: f32 = 1.5;
 
+/// Re-write every controlled fan's duty (and manual-mode bit) at least this
+/// often, even if nothing changed. The control loop dedups writes against what
+/// it last commanded; if the Super-I/O was reset underneath it (S3 resume, or
+/// other software / BIOS SMM taking a header back) that cache would otherwise
+/// say "already applied" forever while the fan runs the BIOS curve.
+#[cfg(windows)]
+const REASSERT_EVERY: Duration = Duration::from_secs(30);
+
+/// Sensor-loss failsafe: if a curve fan's temperature source has been missing
+/// for this long, drive that fan to 100% until the reading returns. Before, a
+/// vanished sensor made the curve fan hold whatever duty it last had — possibly
+/// low — indefinitely, with the watchdog kept happy by the running loop.
+#[cfg(windows)]
+const SENSOR_LOSS_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct FanConfig {
@@ -346,6 +361,12 @@ struct Inner {
     /// disk only on the actual transition, not every control pass.
     #[cfg(windows)]
     marker_armed: bool,
+    /// Last time the control loop forced a full re-write (see `REASSERT_EVERY`).
+    #[cfg(windows)]
+    control_last_reassert: Instant,
+    /// Per curve fan: when its temperature source first went missing.
+    #[cfg(windows)]
+    temp_missing_since: std::collections::HashMap<u8, Instant>,
 }
 
 impl FanSubsystem {
@@ -382,6 +403,10 @@ impl FanSubsystem {
                 recovery_marker: None,
                 #[cfg(windows)]
                 marker_armed: false,
+                #[cfg(windows)]
+                control_last_reassert: Instant::now(),
+                #[cfg(windows)]
+                temp_missing_since: Default::default(),
             })),
             sweep_cancel: Arc::new(AtomicBool::new(false)),
             control_suspend: Arc::new(AtomicBool::new(false)),
@@ -426,18 +451,35 @@ impl FanSubsystem {
             for h in headers {
                 let _ = chip.force_release_header(h as usize);
             }
-            eprintln!(
+            crate::klog!(
                 "[fan recovery] unclean exit detected — {} mapped header(s) forced back to BIOS",
                 inner.pwm_map.len()
             );
             disarm_marker(&mut inner);
         } else {
-            eprintln!("[fan recovery] marker present but chip unavailable — will retry next launch");
+            crate::klog!("[fan recovery] marker present but chip unavailable — will retry next launch");
         }
     }
 
     #[cfg(not(windows))]
     pub fn init_recovery(&self, _marker: std::path::PathBuf) {}
+
+    /// System resume / display-on. The Super-I/O comes back from S3 with the
+    /// BIOS defaults (manual bits cleared), so forget what the loop thinks it
+    /// already commanded — the next pass re-takes every planned fan. Also
+    /// refresh the heartbeat: wall time spent asleep must not look like a dead
+    /// control loop to the watchdog.
+    #[cfg(windows)]
+    pub fn on_resume(&self) {
+        let mut inner = self.inner.lock();
+        clear_control_cache(&mut inner);
+        inner.temp_missing_since.clear();
+        inner.last_heartbeat = Instant::now();
+        crate::klog!("[fan] resume: control cache cleared, duties will be re-asserted");
+    }
+
+    #[cfg(not(windows))]
+    pub fn on_resume(&self) {}
 
     /// Ensure the chip is open. Non-fatal: a `None` chip just means "unavailable".
     #[cfg(windows)]
@@ -620,7 +662,7 @@ impl FanSubsystem {
         };
         if label == "baseline" || inner.ec_baseline.is_none() {
             inner.ec_baseline = Some(snap);
-            eprintln!(
+            crate::klog!(
                 "[ec capture] baseline stored ({} regs)",
                 inner.ec_baseline.as_ref().unwrap().len()
             );
@@ -631,10 +673,10 @@ impl FanSubsystem {
         for ((addr, new), (_, old)) in snap.iter().zip(base.iter()) {
             if new != old {
                 diffs.push((*addr, *old, *new));
-                eprintln!("[ec diff:{label}] 0x{addr:03X}: 0x{old:02X} -> 0x{new:02X}");
+                crate::klog!("[ec diff:{label}] 0x{addr:03X}: 0x{old:02X} -> 0x{new:02X}");
             }
         }
-        eprintln!("[ec capture] '{label}': {} changed regs", diffs.len());
+        crate::klog!("[ec capture] '{label}': {} changed regs", diffs.len());
         Ok(diffs)
     }
 
@@ -915,7 +957,7 @@ impl FanSubsystem {
                 inner.confirmed_rpm_channels.retain(|&c| c != ch);
                 inner.limits.remove(&header);
                 if was_mapped || was_confirmed {
-                    eprintln!(
+                    crate::klog!(
                         "[fan burst] header {header} (tach {ch}): no fan — stale mapping pruned"
                     );
                 }
@@ -1255,8 +1297,17 @@ impl FanSubsystem {
             marker_armed,
             manual_session_active,
             last_heartbeat,
+            control_last_reassert,
+            temp_missing_since,
             ..
         } = &mut *inner;
+
+        // Periodic full re-assert: drop the write-dedup cache so every planned
+        // fan gets its duty + manual bit written again this pass.
+        if control_last_reassert.elapsed() >= REASSERT_EVERY {
+            control_last_commanded.clear();
+            *control_last_reassert = Instant::now();
+        }
 
         let Some(plan) = control_plan.as_ref() else {
             return;
@@ -1289,11 +1340,11 @@ impl FanSubsystem {
         };
         if emergency != *emergency_active {
             if emergency {
-                eprintln!(
+                crate::klog!(
                     "[fan] THERMAL FAILSAFE engaged at {hottest:.1}°C — forcing controlled fans to 100%"
                 );
             } else {
-                eprintln!(
+                crate::klog!(
                     "[fan] thermal failsafe cleared ({hottest:.1}°C) — resuming curve/manual control"
                 );
                 // The hysteresis anchors predate the emergency; left in place
@@ -1316,6 +1367,7 @@ impl FanSubsystem {
             };
             held = true;
 
+            let mut sensor_lost = false;
             let clamped = if emergency {
                 100
             } else {
@@ -1324,25 +1376,53 @@ impl FanSubsystem {
                     FanControlMode::Curve {
                         temp_source,
                         points,
-                    } => {
-                        let Some(tr) = temps.iter().find(|r| r.key == *temp_source) else {
-                            continue;
-                        };
-                        // Hysteresis: hold the current target unless the source
-                        // has moved past the band since this fan last changed.
-                        if control_last_commanded.contains_key(&rpm_channel) {
-                            if let Some(&last_t) = control_last_temp.get(&rpm_channel) {
-                                if (tr.temp_c - last_t).abs() < CURVE_HYSTERESIS_C {
-                                    continue;
+                    } => match temps.iter().find(|r| r.key == *temp_source) {
+                        None => {
+                            // Source vanished: hold briefly (a single missed read
+                            // is normal), then fail safe to full speed.
+                            let since = *temp_missing_since
+                                .entry(rpm_channel)
+                                .or_insert_with(Instant::now);
+                            if since.elapsed() < SENSOR_LOSS_TIMEOUT {
+                                continue;
+                            }
+                            sensor_lost = true;
+                            100.0
+                        }
+                        Some(tr) => {
+                            if temp_missing_since.remove(&rpm_channel).is_some() {
+                                // Back from a sensor loss: re-anchor hysteresis
+                                // so the fan leaves 100% right away.
+                                control_last_temp.remove(&rpm_channel);
+                                control_last_commanded.remove(&rpm_channel);
+                            }
+                            // Hysteresis: hold the current target unless the
+                            // source has moved past the band since this fan
+                            // last changed.
+                            if control_last_commanded.contains_key(&rpm_channel) {
+                                if let Some(&last_t) = control_last_temp.get(&rpm_channel) {
+                                    if (tr.temp_c - last_t).abs() < CURVE_HYSTERESIS_C {
+                                        continue;
+                                    }
                                 }
                             }
+                            interpolate_curve(points, tr.temp_c)
                         }
-                        interpolate_curve(points, tr.temp_c)
-                    }
+                    },
                 };
-                let limits_h = limits.get(&header).cloned().unwrap_or_default();
-                limits_h.clamp_pct(raw.round().clamp(0.0, 100.0) as u8)
+                if sensor_lost {
+                    100 // like the thermal failsafe, ignores the noise cap
+                } else {
+                    let limits_h = limits.get(&header).cloned().unwrap_or_default();
+                    limits_h.clamp_pct(raw.round().clamp(0.0, 100.0) as u8)
+                }
             };
+            if sensor_lost && control_last_commanded.get(&rpm_channel) != Some(&100) {
+                crate::klog!(
+                    "[fan] SENSOR LOSS: temp source for fan {rpm_channel} missing >{}s — forcing 100%",
+                    SENSOR_LOSS_TIMEOUT.as_secs()
+                );
+            }
 
             let changed = control_last_commanded
                 .get(&rpm_channel)

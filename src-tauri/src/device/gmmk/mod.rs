@@ -39,6 +39,10 @@ struct WorkerState {
     command: Command,
     generation: u64,
     stop: bool,
+    /// Set by `resync()`: forget what we think is on the keyboard and repaint
+    /// the current command from scratch (the per-key delta would otherwise see
+    /// "nothing changed" and write nothing after a wake).
+    force_full: bool,
 }
 
 struct Shared {
@@ -51,6 +55,12 @@ pub struct GmmkDevice {
     shared: Arc<Shared>,
     /// Staging buffer for set_zone_leds before apply() commits it.
     staged: Vec<Color>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+/// Stable device id (also used by the manager to recognise a known keyboard).
+pub fn device_id() -> String {
+    format!("gmmk-{:04x}-{:04x}", controller::VID, controller::PID)
 }
 
 /// Detect the keyboard. Ok(None) = not plugged in.
@@ -63,7 +73,7 @@ pub fn probe() -> Result<Option<GmmkDevice>, DeviceError> {
     let codes = gmmk_tkl::wire_codes();
     let led_count = keys.len() as u32;
     let info = DeviceInfo {
-        id: format!("gmmk-{:04x}-{:04x}", controller::VID, controller::PID),
+        id: device_id(),
         name: "Glorious GMMK (TKL)".to_string(),
         device_type: DeviceType::Keyboard,
         zones: vec![ZoneInfo {
@@ -88,12 +98,13 @@ pub fn probe() -> Result<Option<GmmkDevice>, DeviceError> {
             command: Command::Frame(vec![Color::BLACK; led_count as usize]),
             generation: 0,
             stop: false,
+            force_full: false,
         }),
         cond: Condvar::new(),
     });
 
     let worker_shared = shared.clone();
-    thread::Builder::new()
+    let worker = thread::Builder::new()
         .name("gmmk-writer".to_string())
         .spawn(move || worker(ctl, worker_shared, codes))
         .map_err(|e| DeviceError::Comm(e.to_string()))?;
@@ -102,10 +113,16 @@ pub fn probe() -> Result<Option<GmmkDevice>, DeviceError> {
         info,
         shared,
         staged: vec![Color::BLACK; led_count as usize],
+        worker: Some(worker),
     }))
 }
 
-fn worker(ctl: GmmkController, shared: Arc<Shared>, codes: Vec<[u8; 3]>) {
+/// Consecutive failed commands before the writer re-opens the keyboard (USB
+/// re-enumeration after sleep leaves the old handle permanently dead).
+const RECONNECT_AFTER_FAILURES: u32 = 3;
+
+fn worker(mut ctl: GmmkController, shared: Arc<Shared>, codes: Vec<[u8; 3]>) {
+    let mut failures = 0u32;
     let mut last: Option<Vec<Color>> = None;
     // Whether profile 1 is currently in custom (per-key) mode. Applying an
     // onboard effect leaves custom mode, so this resets afterwards.
@@ -118,11 +135,16 @@ fn worker(ctl: GmmkController, shared: Arc<Shared>, codes: Vec<[u8; 3]>) {
     loop {
         let command = {
             let mut st = shared.state.lock();
-            while !st.stop && st.generation == seen_generation && !pending_retry {
+            while !st.stop && st.generation == seen_generation && !pending_retry && !st.force_full
+            {
                 shared.cond.wait(&mut st);
             }
             if st.stop {
                 return;
+            }
+            if std::mem::take(&mut st.force_full) {
+                custom_inited = false;
+                last = None;
             }
             seen_generation = st.generation;
             st.command.clone()
@@ -161,13 +183,41 @@ fn worker(ctl: GmmkController, shared: Arc<Shared>, codes: Vec<[u8; 3]>) {
         };
 
         match res {
-            Ok(()) => pending_retry = false,
+            Ok(()) => {
+                if failures > 0 {
+                    crate::klog!("gmmk: recovered after {failures} failed commands");
+                }
+                failures = 0;
+                pending_retry = false;
+            }
             Err(e) => {
                 pending_retry = true;
-                eprintln!("gmmk: command failed: {e}");
+                failures += 1;
+                if failures <= 3 || failures.is_multiple_of(50) {
+                    crate::klog!("gmmk: command failed ({failures} in a row): {e}");
+                }
                 custom_inited = false;
                 last = None;
-                thread::sleep(Duration::from_millis(500));
+                if failures >= RECONNECT_AFTER_FAILURES {
+                    match GmmkController::open() {
+                        Ok(Some(new_ctl)) => {
+                            crate::klog!("gmmk: keyboard re-opened after {failures} failures");
+                            ctl = new_ctl;
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            if failures <= 3 || failures.is_multiple_of(50) {
+                                crate::klog!("gmmk: reconnect failed: {e}");
+                            }
+                        }
+                    }
+                }
+                let delay = if failures > 10 { 5_000 } else { 500 };
+                let mut st = shared.state.lock();
+                if !st.stop {
+                    shared.cond.wait_for(&mut st, Duration::from_millis(delay));
+                }
             }
         }
     }
@@ -261,8 +311,8 @@ impl RgbDevice for GmmkDevice {
         &self.info.id
     }
 
-    fn info(&self) -> DeviceInfo {
-        self.info.clone()
+    fn info(&self) -> &DeviceInfo {
+        &self.info
     }
 
     fn set_zone_leds(&mut self, zone_id: &str, colors: &[Color]) -> Result<(), DeviceError> {
@@ -291,6 +341,11 @@ impl RgbDevice for GmmkDevice {
         self.submit(Command::Onboard(*effect, brightness));
         Ok(())
     }
+
+    fn resync(&mut self) {
+        self.shared.state.lock().force_full = true;
+        self.shared.cond.notify_one();
+    }
 }
 
 impl Drop for GmmkDevice {
@@ -299,5 +354,9 @@ impl Drop for GmmkDevice {
         st.stop = true;
         drop(st);
         self.shared.cond.notify_one();
+        // Release the HID handle before any re-probe opens a new one.
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
     }
 }

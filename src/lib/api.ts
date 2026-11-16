@@ -64,6 +64,25 @@ export const scanRgbConflicts = () =>
 export const killRgbConflicts = (pids: number[]) =>
   invoke<void>("kill_rgb_conflicts", { pids });
 
+/** "Continue anyway": enable hardware writes without killing anything. */
+export const ackRgbConflicts = () => invoke<void>("ack_rgb_conflicts");
+
+/** Backend conflict-guard settings (persisted in config.json). */
+export interface GuardConfig {
+  /** Shut down conflicting RGB/fan software automatically, every time it appears. */
+  autoEnforce: boolean;
+  /** Also set conflicting Windows services to Disabled so they stay off after reboot. */
+  disableServices: boolean;
+}
+
+export const getGuardConfig = () => invoke<GuardConfig>("get_guard_config");
+
+export const setGuardConfig = (config: GuardConfig) =>
+  invoke<void>("set_guard_config", { config });
+
+/** Open the folder holding kontrolrgb.log in Explorer. */
+export const openLogFolder = () => invoke<void>("open_log_folder");
+
 export const quitApp = () => invoke<void>("quit_app");
 
 // --- Administrator elevation ----------------------------------------------

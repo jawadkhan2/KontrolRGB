@@ -115,6 +115,10 @@ struct Inner {
     dev: Mutex<Device>,
     /// Cross-process ISA-bus arbitration mutex (best-effort; null if unavailable).
     isa: WinHandle,
+    /// Count of failed port I/O calls. `inb`/`outb` are infallible by signature
+    /// (a failure used to silently read as 0 / be dropped), so callers snapshot
+    /// this around a transaction to detect that the driver refused something.
+    io_errors: std::sync::atomic::AtomicU64,
 }
 
 impl Drop for Inner {
@@ -186,6 +190,7 @@ impl Lpc {
             inner: Arc::new(Inner {
                 dev: Mutex::new(Device(WinHandle(handle))),
                 isa: WinHandle(isa),
+                io_errors: std::sync::atomic::AtomicU64::new(0),
             }),
         })
     }
@@ -252,10 +257,31 @@ impl Lpc {
     /// Read one byte from an I/O port (must be an allow-listed SIO/BAR port).
     /// Infallible by contract — a driver/permission failure degrades to 0.
     pub fn inb(&self, port: u16) -> u8 {
-        self.execute("ioctl_pio_inb", &[port as u64], 1)
-            .ok()
-            .and_then(|v| v.first().copied())
-            .unwrap_or(0) as u8
+        match self.execute("ioctl_pio_inb", &[port as u64], 1) {
+            Ok(v) if !v.is_empty() => v[0] as u8,
+            other => {
+                self.note_io_error("inb", port, other.err());
+                0
+            }
+        }
+    }
+
+    /// Total failed port I/O calls so far (see `Inner::io_errors`).
+    pub fn io_error_count(&self) -> u64 {
+        self.inner
+            .io_errors
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn note_io_error(&self, op: &str, port: u16, err: Option<LpcError>) {
+        let n = self
+            .inner
+            .io_errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if n <= 3 || n.is_multiple_of(1000) {
+            crate::klog!("lpc: {op} port 0x{port:04x} failed (#{n}): {err:?}");
+        }
     }
 
     /// Write one byte to an I/O port.
@@ -264,7 +290,9 @@ impl Lpc {
     /// BARs, so only the validated SIO config window and EC data window are
     /// reachable — a stray write elsewhere is rejected in ring 0.
     pub fn outb(&self, port: u16, value: u8) {
-        let _ = self.execute("ioctl_pio_outb", &[port as u64, value as u64], 0);
+        if let Err(e) = self.execute("ioctl_pio_outb", &[port as u64, value as u64], 0) {
+            self.note_io_error("outb", port, Some(e));
+        }
     }
 
     /// Acquire the global ISA-bus arbitration mutex for the returned guard's

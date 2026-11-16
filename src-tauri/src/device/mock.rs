@@ -28,8 +28,8 @@ impl RgbDevice for MockDevice {
         &self.info.id
     }
 
-    fn info(&self) -> DeviceInfo {
-        self.info.clone()
+    fn info(&self) -> &DeviceInfo {
+        &self.info
     }
 
     fn set_zone_leds(&mut self, zone_id: &str, colors: &[Color]) -> Result<(), DeviceError> {

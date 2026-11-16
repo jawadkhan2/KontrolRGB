@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { ConflictProcess } from "../lib/api";
-import { killRgbConflicts, quitApp } from "../lib/api";
+import { ackRgbConflicts, killRgbConflicts, quitApp } from "../lib/api";
 
 type Phase = "confirm" | "killing" | "done" | "error";
 
@@ -12,6 +12,16 @@ interface Props {
 export function ConflictModal({ processes, onDone }: Props) {
   const [phase, setPhase] = useState<Phase>("confirm");
   const [error, setError] = useState<string | null>(null);
+
+  // Skipping used to just close the modal, which left every hardware write
+  // disabled for the rest of the session. Tell the backend we're proceeding.
+  async function handleContinue() {
+    try {
+      await ackRgbConflicts();
+    } finally {
+      onDone();
+    }
+  }
 
   async function handleKillAll() {
     setPhase("killing");
@@ -56,7 +66,7 @@ export function ConflictModal({ processes, onDone }: Props) {
             </ul>
             <div className="flex gap-3 justify-end">
               <button
-                onClick={onDone}
+                onClick={() => void handleContinue()}
                 disabled={phase === "killing"}
                 className="rounded-md px-4 py-2 text-sm text-zinc-400 hover:text-zinc-200 disabled:opacity-40"
               >
@@ -133,7 +143,7 @@ export function ConflictModal({ processes, onDone }: Props) {
                 Quit App
               </button>
               <button
-                onClick={onDone}
+                onClick={() => void handleContinue()}
                 className="rounded-md bg-panel-2 px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-700"
               >
                 Continue Anyway

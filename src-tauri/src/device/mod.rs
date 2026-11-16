@@ -27,7 +27,9 @@ pub enum DeviceError {
 /// Light / Gigabyte GPU later). The effects engine is the only writer.
 pub trait RgbDevice: Send + Sync {
     fn id(&self) -> &str;
-    fn info(&self) -> DeviceInfo;
+    /// Borrowed, so the 30 fps engine loop doesn't clone every device's zone
+    /// list (the GMMK's carries its whole key layout) on every tick.
+    fn info(&self) -> &DeviceInfo;
     /// Stage colors for one zone (already brightness-scaled by the engine).
     fn set_zone_leds(&mut self, zone_id: &str, colors: &[Color]) -> Result<(), DeviceError>;
     /// Flush the staged frame to hardware.
@@ -45,4 +47,11 @@ pub trait RgbDevice: Send + Sync {
     ) -> Result<(), DeviceError> {
         Err(DeviceError::Unsupported)
     }
+
+    /// Something may have clobbered the hardware state behind our back (system
+    /// resume, display-on, another program touching the device). Re-assert the
+    /// current state on the next write, even if it looks unchanged. The engine
+    /// also drops its frame cache at the same time, so every device gets its
+    /// frame re-staged. Default: nothing extra to do.
+    fn resync(&mut self) {}
 }

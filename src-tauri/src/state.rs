@@ -58,6 +58,15 @@ pub struct AppState {
     /// loaded; independent of the GPU's RGB controller. Shared (`Arc`) with the
     /// fan control loop so a fan curve can be driven off the GPU die temp.
     pub gpu_telemetry: Arc<crate::gpu_telemetry::GpuTelemetrySubsystem>,
+    /// Conflict-guard settings (auto-enforce etc.); persisted in config.json.
+    pub guard: Mutex<crate::process_guard::GuardConfig>,
+    /// Last known resizable-zone LED counts per device id. Lets a save keep a
+    /// device's counts while it is temporarily absent (mock in its slot), so a
+    /// missed probe can no longer wipe them from config.json.
+    pub known_zone_counts: Mutex<HashMap<DeviceId, HashMap<String, u32>>>,
+    /// Whether the main window is showing. The effects engine skips preview
+    /// emission (and idles harder) while it's hidden in the tray.
+    pub ui_visible: AtomicBool,
 }
 
 impl AppState {
@@ -77,7 +86,20 @@ impl AppState {
             fan: crate::fan::FanSubsystem::new(conflicts_cleared.clone(), gpu_telemetry.clone()),
             gpu_telemetry,
             conflicts_cleared,
+            guard: Mutex::new(Default::default()),
+            known_zone_counts: Mutex::new(HashMap::new()),
+            ui_visible: AtomicBool::new(false),
         }
+    }
+
+    /// Re-assert every device's lighting: each backend re-arms / repaints on its
+    /// next write, and the engine drops its "already sent" cache so static
+    /// effects get re-staged too. Cheap; safe to call from any thread. Used on
+    /// resume, display-on, and after the conflict guard shut something down.
+    pub fn request_resync(&self) {
+        self.manager.lock().resync_all();
+        self.device_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Ensure every known device has a runtime state entry. New entries get a

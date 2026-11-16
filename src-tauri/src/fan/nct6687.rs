@@ -203,6 +203,8 @@ pub enum ChipError {
     FanConfigRejected,
     #[error("sweep cancelled by user")]
     SweepCancelled,
+    #[error("Super-I/O driver refused a port access during an EC transaction")]
+    Io,
 }
 
 /// One channel's live reading.
@@ -317,7 +319,7 @@ impl Drop for FanCfgGuard<'_> {
             // `start_fan_cfg` expects (req == 0). Errors are ignored — this is the
             // cleanup path, and we're already holding the ISA lock from commit_duty.
             let _ = self.chip.ec_write(FAN_PWM_REQUEST_REG, 0);
-            eprintln!("[fan cfg] uncommitted window closed by guard — request cleared");
+            crate::klog!("[fan cfg] uncommitted window closed by guard — request cleared");
         }
     }
 }
@@ -457,7 +459,7 @@ impl Nct6687 {
             if cfg & 0x80 == 0 {
                 // Surprising (validate saw live tachs), but never force it — a
                 // write here is exactly the config-space poke we're eliminating.
-                eprintln!("[fan init] HWM_CFG=0x{cfg:02X} (bit7 clear) — leaving firmware untouched");
+                crate::klog!("[fan init] HWM_CFG=0x{cfg:02X} (bit7 clear) — leaving firmware untouched");
             }
         }
     }
@@ -511,6 +513,7 @@ impl Nct6687 {
         let _isa = self.lpc.isa_lock();
         let page = (addr >> 8) as u8;
         let index = (addr & 0xFF) as u8;
+        let errors_before = self.lpc.io_error_count();
 
         self.ec_wait_window();
         self.lpc.outb(self.base + EC_PAGE, page);
@@ -518,6 +521,11 @@ impl Nct6687 {
         let data = self.lpc.inb(self.base + EC_DATA);
         // Release the window so other readers (and BIOS) can use it.
         self.lpc.outb(self.base + EC_PAGE, EC_PAGE_SELECT);
+        // A refused port access would otherwise surface as a plausible-looking
+        // 0x00 byte (0 RPM / no temperature) — report it as an error instead.
+        if self.lpc.io_error_count() != errors_before {
+            return Err(ChipError::Io);
+        }
         Ok(data)
     }
 
@@ -633,11 +641,15 @@ impl Nct6687 {
         let _isa = self.lpc.isa_lock();
         let page = (addr >> 8) as u8;
         let index = (addr & 0xFF) as u8;
+        let errors_before = self.lpc.io_error_count();
         self.ec_wait_window();
         self.lpc.outb(self.base + EC_PAGE, page);
         self.lpc.outb(self.base + EC_INDEX, index);
         self.lpc.outb(self.base + EC_DATA, value);
         self.lpc.outb(self.base + EC_PAGE, EC_PAGE_SELECT);
+        if self.lpc.io_error_count() != errors_before {
+            return Err(ChipError::Io);
+        }
         Ok(())
     }
 
@@ -667,7 +679,7 @@ impl Nct6687 {
         let mut out = Vec::with_capacity(0x10000);
         for page in 0..=0xFFu16 {
             if Instant::now() >= deadline {
-                eprintln!("[ec scan] budget hit after {} regs — returning partial", out.len());
+                crate::klog!("[ec scan] budget hit after {} regs — returning partial", out.len());
                 break;
             }
             for i in 0..=0xFFu16 {

@@ -208,20 +208,74 @@ pub fn rescan_devices(app: AppHandle, state: State<'_, Arc<AppState>>) -> Vec<De
     rescan_and_notify(&app, &state)
 }
 
-/// Re-detect hardware, bump the engine's device generation (so it drops cached
-/// frames belonging to the old handles), re-seed runtime state, and push the
-/// refreshed device list to the frontend. Shared by the rescan command and the
-/// wake-from-sleep recovery path.
+/// Full user-requested re-detect: tear every device down, probe all slots from
+/// scratch, restore saved config, and push the refreshed list to the frontend.
+/// The slow parts (writer-thread joins, HID/NvAPI probes) run outside the
+/// manager lock so the effects engine keeps ticking meanwhile.
+///
+/// Only the Rescan button does this. Automatic recovery (wake, hot-plug) uses
+/// `request_resync` + `retry_missing_devices`, which never replace hardware
+/// that is already working.
 pub fn rescan_and_notify(app: &AppHandle, state: &AppState) -> Vec<DeviceInfo> {
-    state.manager.lock().rescan();
+    crate::persistence::remember_zone_counts(state);
+    let old = state.manager.lock().take_all();
+    drop(old); // joins writer threads, releasing the HID handles
+    let fresh = crate::device::manager::DeviceManager::probe_all();
+    state.manager.lock().set_all(fresh);
+    after_device_change(app, state)
+}
+
+/// Shared tail of every device-set change: bump the engine generation (its
+/// cached frames belong to old handles), seed runtime for new ids, restore any
+/// saved config for devices that (re)appeared, and notify the frontend.
+fn after_device_change(app: &AppHandle, state: &AppState) -> Vec<DeviceInfo> {
     state.device_generation.fetch_add(1, Ordering::Relaxed);
     state.seed_runtime();
-    // Restore saved config for any device that (re)appeared this scan, so a
-    // hot-plug or wake-from-sleep re-enumeration doesn't leave it on defaults.
     crate::persistence::reapply_after_rescan(state);
     let infos = infos_with_names(state);
     let _ = app.emit("devices-changed", infos.clone());
     infos
+}
+
+/// Hot-plug / late enumeration: probe only slots currently on a mock and
+/// upgrade any that now find real hardware. With `known_only`, only slots whose
+/// real device the user has saved config for are probed (keeps the periodic
+/// background check from poking hardware this machine doesn't have).
+/// Returns true if any slot was upgraded.
+pub fn retry_missing_devices(app: &AppHandle, state: &AppState, known_only: bool) -> bool {
+    let missing = state.manager.lock().missing_slots();
+    if missing.is_empty() {
+        return false;
+    }
+    // Capture the live devices' current LED counts first: the shared tail below
+    // restores remembered counts, and must not revert a resize the user made
+    // since the last save.
+    crate::persistence::remember_zone_counts(state);
+    let mut upgraded = false;
+    for slot in missing {
+        if known_only {
+            let id = slot.real_id();
+            let known = state.runtime.lock().contains_key(&id)
+                || state.stale_device_configs.lock().contains_key(&id);
+            if !known {
+                continue;
+            }
+        }
+        let Some(dev) = crate::device::manager::DeviceManager::probe_real(slot) else {
+            continue;
+        };
+        let leftover = state.manager.lock().upgrade(slot, dev);
+        drop(leftover);
+        crate::klog!("{slot:?}: hardware came back, now controlled again");
+        upgraded = true;
+    }
+    if upgraded {
+        // The re-appeared device's saved config lives in `runtime` (it was
+        // live earlier) or the stale store; make sure zone sizes follow it.
+        crate::persistence::restore_zone_counts(state);
+        after_device_change(app, state);
+    }
+    upgraded
 }
 
 // --- Fan control (case fans, NCT6687D-R) ---------------------------------
@@ -509,22 +563,81 @@ pub async fn gpu_telemetry(
 
 // --- Startup conflict guard -----------------------------------------------
 
+/// Startup check from the UI. With auto-enforce on, the backend guard already
+/// handles everything (it runs an immediate pass here too, in case the UI beat
+/// the guard thread), so the UI gets an empty list and shows no modal. With it
+/// off, the found processes are returned for the manual modal.
 #[tauri::command]
-pub fn scan_rgb_conflicts(
+pub async fn scan_rgb_conflicts(
     state: State<'_, Arc<AppState>>,
-) -> Vec<crate::process_guard::ConflictProcess> {
-    let found = crate::process_guard::scan();
-    if found.is_empty() {
-        state.conflicts_cleared.store(true, Ordering::Relaxed);
-    }
-    found
+) -> CmdResult<Vec<crate::process_guard::ConflictProcess>> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let cfg = *state.guard.lock();
+        if cfg.auto_enforce {
+            let mut sys = sysinfo::System::new();
+            let mut seen = Vec::new();
+            crate::process_guard::enforce_once(&mut sys, cfg, &mut seen);
+            state.conflicts_cleared.store(true, Ordering::Relaxed);
+            return Vec::new();
+        }
+        let found = crate::process_guard::scan();
+        if found.is_empty() {
+            state.conflicts_cleared.store(true, Ordering::Relaxed);
+        }
+        found
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn kill_rgb_conflicts(state: State<'_, Arc<AppState>>, pids: Vec<u32>) -> CmdResult<()> {
-    crate::process_guard::kill(&pids)?;
+pub async fn kill_rgb_conflicts(state: State<'_, Arc<AppState>>, pids: Vec<u32>) -> CmdResult<()> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let disable = state.guard.lock().disable_services;
+        let r = crate::process_guard::kill(&pids, disable);
+        // Whatever happened, the user chose to proceed; enable hardware writes
+        // and take back anything the other software changed.
+        state.conflicts_cleared.store(true, Ordering::Relaxed);
+        state.request_resync();
+        r
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// "Skip & Continue" / "Continue Anyway" in the conflict modal. Previously the
+/// modal just closed and hardware writes stayed disabled for the whole session.
+#[tauri::command]
+pub fn ack_rgb_conflicts(state: State<'_, Arc<AppState>>) {
     state.conflicts_cleared.store(true, Ordering::Relaxed);
-    Ok(())
+}
+
+#[tauri::command]
+pub fn get_guard_config(state: State<'_, Arc<AppState>>) -> crate::process_guard::GuardConfig {
+    *state.guard.lock()
+}
+
+#[tauri::command]
+pub fn set_guard_config(
+    state: State<'_, Arc<AppState>>,
+    config: crate::process_guard::GuardConfig,
+) {
+    *state.guard.lock() = config;
+    mark_dirty(&state);
+}
+
+/// Open the folder holding kontrolrgb.log in Explorer.
+#[tauri::command]
+pub fn open_log_folder() -> CmdResult<()> {
+    let dir = crate::logging::log_dir().ok_or("log folder unavailable")?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::process::Command::new("explorer.exe")
+        .arg(&dir)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Clean shutdown: hand any held fans back to the BIOS, flush config to disk,

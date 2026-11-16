@@ -18,6 +18,8 @@ struct ConfigFile {
     version: u32,
     #[serde(default)]
     fan: FanConfig,
+    #[serde(default)]
+    guard: crate::process_guard::GuardConfig,
     devices: HashMap<DeviceId, DeviceConfig>,
 }
 
@@ -54,7 +56,7 @@ fn apply_device_config(
 ) {
     for (zone_id, count) in &dev_config.zone_led_counts {
         if let Err(e) = device.resize_zone(zone_id, *count) {
-            eprintln!("restore resize {id}/{zone_id}: {e}");
+            crate::klog!("restore resize {id}/{zone_id}: {e}");
         }
     }
     if !dev_config.zone_names.is_empty() {
@@ -74,11 +76,20 @@ pub fn load_and_apply(app: &tauri::AppHandle, state: &AppState) {
         return;
     };
     let Ok(config) = serde_json::from_str::<ConfigFile>(&raw) else {
-        eprintln!("config.json unreadable, using defaults");
+        crate::klog!("config.json unreadable, using defaults");
         return;
     };
 
     state.fan.apply_config(config.fan);
+    *state.guard.lock() = config.guard;
+    {
+        let mut known = state.known_zone_counts.lock();
+        for (id, cfg) in &config.devices {
+            if !cfg.zone_led_counts.is_empty() {
+                known.insert(id.clone(), cfg.zone_led_counts.clone());
+            }
+        }
+    }
 
     let mut manager = state.manager.lock();
     let mut runtime = state.runtime.lock();
@@ -126,27 +137,74 @@ pub fn reapply_after_rescan(state: &AppState) {
     }
 }
 
-fn snapshot(state: &AppState) -> ConfigFile {
-    let zone_counts: HashMap<DeviceId, HashMap<String, u32>> = state
-        .manager
-        .lock()
-        .infos()
-        .into_iter()
-        .map(|info| {
-            let counts = info
+/// Record the live resizable-zone LED counts of every *real* device into
+/// `known_zone_counts`, so they survive the device being absent for a while.
+pub fn remember_zone_counts(state: &AppState) {
+    let mut manager = state.manager.lock();
+    let real = manager.real_ids();
+    let mut known = state.known_zone_counts.lock();
+    for id in real {
+        let Some(dev) = manager.get_mut(&id) else {
+            continue;
+        };
+        let counts: HashMap<String, u32> = dev
+            .info()
+            .zones
+            .iter()
+            .filter(|z| z.resizable)
+            .map(|z| (z.id.clone(), z.led_count))
+            .collect();
+        if !counts.is_empty() {
+            known.insert(id, counts);
+        }
+    }
+}
+
+/// Re-apply remembered LED counts to live devices whose zones differ (a fresh
+/// probe always starts at the backend default). Call after any device change.
+pub fn restore_zone_counts(state: &AppState) {
+    let known = state.known_zone_counts.lock().clone();
+    let mut manager = state.manager.lock();
+    let mut runtime = state.runtime.lock();
+    for (id, counts) in known {
+        let Some(dev) = manager.get_mut(&id) else {
+            continue;
+        };
+        for (zone_id, count) in counts {
+            let current = dev
+                .info()
                 .zones
                 .iter()
-                .filter(|z| z.resizable)
-                .map(|z| (z.id.clone(), z.led_count))
-                .collect();
-            (info.id, counts)
-        })
-        .collect();
+                .find(|z| z.id == zone_id)
+                .map(|z| z.led_count);
+            if current.is_some_and(|c| c != count) {
+                match dev.resize_zone(&zone_id, count) {
+                    Ok(()) => {
+                        if let Some(colors) = runtime
+                            .get_mut(&id)
+                            .and_then(|rt| rt.custom_colors.get_mut(&zone_id))
+                        {
+                            colors.resize(count as usize, crate::device::types::Color::BLACK);
+                        }
+                    }
+                    Err(e) => crate::klog!("restore resize {id}/{zone_id}: {e}"),
+                }
+            }
+        }
+    }
+}
 
+fn snapshot(state: &AppState) -> ConfigFile {
+    remember_zone_counts(state);
+    // Live real devices were just folded in above; absent ones keep their last
+    // known counts instead of being saved with none (the old behaviour wiped a
+    // board's LED counts from disk whenever a probe missed it).
+    let zone_counts = state.known_zone_counts.lock().clone();
+
+    // Lock order (crate-wide): manager → runtime → identify → zone_names → stale.
+    let runtime = state.runtime.lock();
     let zone_names = state.zone_names.lock();
-    let mut devices: HashMap<DeviceId, DeviceConfig> = state
-        .runtime
-        .lock()
+    let mut devices: HashMap<DeviceId, DeviceConfig> = runtime
         .iter()
         .map(|(id, rt)| {
             (
@@ -159,6 +217,8 @@ fn snapshot(state: &AppState) -> ConfigFile {
             )
         })
         .collect();
+    drop(zone_names);
+    drop(runtime);
 
     // Preserve configs for devices absent this session so unplugging a keyboard
     // (or a device missing at boot) never wipes its saved effect/zones. A live
@@ -170,6 +230,7 @@ fn snapshot(state: &AppState) -> ConfigFile {
     ConfigFile {
         version: 1,
         fan: state.fan.config(),
+        guard: *state.guard.lock(),
         devices,
     }
 }
@@ -210,7 +271,7 @@ pub fn save_now(app: &tauri::AppHandle, state: &AppState) {
     match save(app, state) {
         Ok(()) => state.dirty.store(false, Ordering::Relaxed),
         Err(e) => {
-            eprintln!("config save failed: {e}");
+            crate::klog!("config save failed: {e}");
             state.dirty.store(true, Ordering::Relaxed);
         }
     }
@@ -223,7 +284,7 @@ pub async fn run_saver(app: tauri::AppHandle, state: Arc<AppState>) {
         interval.tick().await;
         if state.dirty.swap(false, Ordering::Relaxed) {
             if let Err(e) = save(&app, &state) {
-                eprintln!("config save failed: {e}");
+                crate::klog!("config save failed: {e}");
                 state.dirty.store(true, Ordering::Relaxed);
             }
         }

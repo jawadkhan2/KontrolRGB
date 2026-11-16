@@ -4,6 +4,12 @@ import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { useSettings } from "../store/settings";
 import { useFans } from "../store/fans";
 import {
+  getGuardConfig,
+  openLogFolder,
+  setGuardConfig,
+  type GuardConfig,
+} from "../lib/api";
+import {
   checkForUpdate,
   installUpdate,
   type UpdateStatus,
@@ -262,6 +268,56 @@ function StartupRow() {
   );
 }
 
+/** Backend conflict guard (auto-close other RGB/fan software) + log access. The
+ *  settings live in the backend config, not localStorage, because the guard
+ *  runs before the window ever opens on a boot launch. */
+function GuardRows() {
+  const [cfg, setCfg] = useState<GuardConfig | null>(null);
+
+  useEffect(() => {
+    getGuardConfig().then(setCfg).catch(() => {});
+  }, []);
+
+  const update = (patch: Partial<GuardConfig>) => {
+    if (!cfg) return;
+    const next = { ...cfg, ...patch };
+    setCfg(next);
+    setGuardConfig(next).catch(() => setCfg(cfg));
+  };
+
+  return (
+    <>
+      <ToggleRow
+        title="Keep other RGB / fan software closed"
+        description="KontrolRGB is the only app driving your lighting and fans. Checks every 15 seconds and shuts down anything that competes for the hardware (MSI Center & Mystic Light services, LED Keeper, SignalRGB, OpenRGB, iCUE, Armoury Crate, …), then re-applies your lighting. Needs administrator rights to stop services."
+        checked={!!cfg?.autoEnforce}
+        onChange={(v) => update({ autoEnforce: v })}
+      />
+      <ToggleRow
+        title="Disable their Windows services"
+        description="When a conflicting app runs as a Windows service, also set the service to Disabled so it doesn't come back after a reboot. Re-enable it from services.msc if you ever want it back."
+        checked={!!cfg?.disableServices}
+        onChange={(v) => update({ disableServices: v })}
+      />
+      <div className="flex items-center justify-between gap-4 px-5 py-4">
+        <div>
+          <div className="text-sm font-medium text-zinc-200">Diagnostic log</div>
+          <p className="mt-0.5 text-xs text-zinc-500">
+            KontrolRGB logs hardware recovery, wake events and conflicts to
+            kontrolrgb.log. Attach it when reporting a problem.
+          </p>
+        </div>
+        <button
+          onClick={() => void openLogFolder()}
+          className="shrink-0 rounded-lg bg-panel-2 px-4 py-2 text-sm font-semibold text-zinc-100 transition-colors hover:text-white"
+        >
+          Open folder
+        </button>
+      </div>
+    </>
+  );
+}
+
 export function SettingsPage() {
   const fanControlOnStartup = useSettings((s) => s.fanControlOnStartup);
   const setFanControlOnStartup = useSettings((s) => s.setFanControlOnStartup);
@@ -299,6 +355,10 @@ export function SettingsPage() {
             onChange={setAskAdminOnStartup}
           />
           <UpdateRow />
+        </SettingsSection>
+
+        <SettingsSection title="Hardware ownership">
+          <GuardRows />
         </SettingsSection>
 
         <SettingsSection title="Lighting">

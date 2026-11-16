@@ -55,5 +55,6 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Power",                   # RegisterPowerSettingNotification
     "Win32_System_SystemServices",          # GUID_CONSOLE_DISPLAY_STATE
     "Win32_System_LibraryLoader",           # GetModuleHandleW
+    "Win32_System_SystemInformation",       # GetLocalTime (log timestamps)
 ] }
 

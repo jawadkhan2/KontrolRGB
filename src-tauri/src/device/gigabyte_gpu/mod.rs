@@ -66,7 +66,7 @@ pub fn probe() -> Result<Option<GigabyteGpuDevice>, DeviceError> {
         }
 
         let info = DeviceInfo {
-            id: "gigabyte-gpu".to_string(),
+            id: device_id(),
             name: "Gigabyte RTX 5080 Gaming OC".to_string(),
             device_type: DeviceType::Gpu,
             zones: vec![ZoneInfo {
@@ -112,12 +112,21 @@ pub fn probe() -> Result<Option<GigabyteGpuDevice>, DeviceError> {
 /// whatever the controller can take instead of being streamed at 30 fps.
 fn worker(ctl: Controller, shared: Arc<Shared>) {
     let mut seen_generation = 0u64;
+    let mut failures = 0u32;
 
     loop {
         let color = {
             let mut st = shared.state.lock();
-            while !st.stop && st.generation == seen_generation {
+            // A failed write is retried (after a short wait) even with no new
+            // frame — static effects only ever send one.
+            while !st.stop && st.generation == seen_generation && failures == 0 {
                 shared.cond.wait(&mut st);
+            }
+            if failures > 0 && !st.stop && st.generation == seen_generation {
+                let delay = if failures > 10 { 5_000 } else { 1_000 };
+                shared
+                    .cond
+                    .wait_for(&mut st, std::time::Duration::from_millis(delay));
             }
             if st.stop {
                 return;
@@ -126,8 +135,19 @@ fn worker(ctl: Controller, shared: Arc<Shared>) {
             st.color
         };
 
-        if let Err(e) = ctl.set_color(color) {
-            eprintln!("gigabyte-gpu: colour write failed: {e}");
+        match ctl.set_color(color) {
+            Ok(()) => {
+                if failures > 0 {
+                    crate::klog!("gigabyte-gpu: recovered after {failures} failed writes");
+                }
+                failures = 0;
+            }
+            Err(e) => {
+                failures += 1;
+                if failures <= 3 || failures.is_multiple_of(50) {
+                    crate::klog!("gigabyte-gpu: colour write failed ({failures} in a row): {e}");
+                }
+            }
         }
     }
 }
@@ -137,8 +157,8 @@ impl RgbDevice for GigabyteGpuDevice {
         &self.info.id
     }
 
-    fn info(&self) -> DeviceInfo {
-        self.info.clone()
+    fn info(&self) -> &DeviceInfo {
+        &self.info
     }
 
     fn set_zone_leds(&mut self, zone_id: &str, colors: &[Color]) -> Result<(), DeviceError> {
@@ -163,7 +183,23 @@ impl RgbDevice for GigabyteGpuDevice {
     fn resize_zone(&mut self, zone_id: &str, _led_count: u32) -> Result<(), DeviceError> {
         Err(DeviceError::NotResizable(zone_id.to_string()))
     }
+
+    fn resync(&mut self) {
+        // The GPU's RGB MCU can also reset on display power-down; a generation
+        // bump makes the writer push the current colour again.
+        let mut st = self.shared.state.lock();
+        st.generation += 1;
+        drop(st);
+        self.shared.cond.notify_one();
+    }
 }
+
+/// Stable device id (also used by the manager to recognise a known card).
+pub fn device_id() -> String {
+    ZONE_DEVICE_ID.to_string()
+}
+
+const ZONE_DEVICE_ID: &str = "gigabyte-gpu";
 
 impl Drop for GigabyteGpuDevice {
     fn drop(&mut self) {

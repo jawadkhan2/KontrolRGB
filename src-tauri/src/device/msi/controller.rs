@@ -63,6 +63,10 @@ const SETUP: [u8; 290] = [
     0x00,
 ];
 
+/// End (exclusive) of the setup rows we own: report id + JARGB 1..3 + JAF,
+/// 16 bytes each. `direct_mode_active` compares exactly these.
+const DIRECT_ROWS_END: usize = 1 + 4 * 16;
+
 fn comm(e: impl std::fmt::Display) -> DeviceError {
     DeviceError::Comm(e.to_string())
 }
@@ -94,6 +98,25 @@ impl MsiController {
     /// mode on error).
     pub fn send_setup(&self) -> Result<(), DeviceError> {
         self.dev.send_feature_report(&SETUP).map_err(comm)
+    }
+
+    /// Read the controller's live setup back (GET_FEATURE 0x50) and report
+    /// whether the JARGB/JAF rows still hold our direct-mode configuration.
+    ///
+    /// Verified on the Z890 Tomahawk: the board answers with the 290-byte setup
+    /// it is currently running, and right after `send_setup` the first four
+    /// rows match `SETUP` byte-for-byte. When MSI's LED keeper (or a firmware
+    /// reset after sleep) puts the headers back on an onboard effect those rows
+    /// change — while 0x51 color writes keep "succeeding" and are ignored. So
+    /// this is the only reliable way to notice the board left direct mode.
+    pub fn direct_mode_active(&self) -> Result<bool, DeviceError> {
+        let mut buf = [0u8; SETUP.len()];
+        buf[0] = SETUP[0];
+        let n = self.dev.get_feature_report(&mut buf).map_err(comm)?;
+        if n < DIRECT_ROWS_END {
+            return Err(DeviceError::Comm(format!("short setup read-back ({n} bytes)")));
+        }
+        Ok(buf[1..DIRECT_ROWS_END] == SETUP[1..DIRECT_ROWS_END])
     }
 
     /// Stream one header's per-LED colors (report id 0x51). `hdr1` is the header
