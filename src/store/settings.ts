@@ -36,7 +36,10 @@ export type SyncEffectId =
   | "tide"
   | "cascade"
   | "neon_noir"
-  | "glacier";
+  | "glacier"
+  | "supernova"
+  | "lava_lamp"
+  | "reactor";
 
 interface PersistedSettings {
   /**

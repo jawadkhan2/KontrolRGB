@@ -373,6 +373,22 @@ pub fn compute_frame(
                 })
                 .collect()
         }
+        EffectConfig::Supernova { speed } => {
+            let ts = t * speed;
+            let ign = supernova_ignition(ts, zone.keys.is_none());
+            planar_positions(zone)
+                .into_iter()
+                .map(|(x, y)| supernova_at(x, y, ts, ign))
+                .collect()
+        }
+        EffectConfig::LavaLamp { color, speed } => planar_positions(zone)
+            .into_iter()
+            .map(|(x, y)| lava_at(x, y, t * speed, *color))
+            .collect(),
+        EffectConfig::Reactor { color, speed } => spatial_positions(zone)
+            .into_iter()
+            .map(|(_, y)| reactor_at(1.0 - y, t * speed, *color))
+            .collect(),
         // The firmware animates onboard effects on the device itself. We can't
         // phase-sync to it, but the user wants the on-screen preview to MOVE so
         // it reads like the real board. `onboard_frame` is a host approximation
@@ -481,9 +497,140 @@ fn nonspatial_frame(effect: &EffectConfig, n: usize, t: f32) -> Option<Vec<Color
                 Color { r: 150, g: 225, b: 255 }.scale(rim * (-(dr / 0.14) * (dr / 0.14)).exp()),
             )
         }
+        // Planar effects sampled at the lamp; Supernova ignites on the lamp
+        // itself so it sees charge -> flash -> cooling embers.
+        EffectConfig::Supernova { speed } => supernova_at(0.5, 0.5, t * speed, (0.5, 0.5)),
+        EffectConfig::LavaLamp { color, speed } => lava_at(0.5, 0.5, t * speed, *color),
+        EffectConfig::Reactor { color, speed } => reactor_lamp(t * speed, *color),
         _ => return None,
     };
     Some(vec![color; n])
+}
+
+// ---------------------------------------------------------------------------
+// Supernova / Lava Lamp / Reactor. Each is a pure function of an LED position and effect
+// time `ts` (= t * speed) so the spatial path and the single-lamp path share
+// the exact same math.
+// ---------------------------------------------------------------------------
+
+fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    let k = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    k * k * (3.0 - 2.0 * k)
+}
+
+/// Blackbody-ish cooling ramp: 1 = white-hot, ~0.6 gold, ~0.3 orange-red, 0 dark.
+fn heat_color(heat: f32) -> Color {
+    let h = heat.clamp(0.0, 1.0);
+    let hue = 4.0 + 46.0 * smoothstep(0.1, 0.8, h);
+    let sat = 1.0 - 0.85 * smoothstep(0.7, 1.0, h);
+    Color::from_hsv(hue, sat, h.powf(0.7))
+}
+
+const SUPERNOVA_PERIOD: f32 = 4.8;
+
+/// Where this cycle's star ignites. Rings pick a random point ON the ring so
+/// the shock front visibly races around it both ways.
+fn supernova_ignition(ts: f32, ring: bool) -> (f32, f32) {
+    let cyc = (ts / SUPERNOVA_PERIOD).floor() as i64 as u64;
+    let h = hash01(cyc.wrapping_mul(0x5851_F42D));
+    if ring {
+        let a = h * TAU;
+        (0.5 - 0.5 * a.sin(), 0.5 - 0.5 * a.cos())
+    } else {
+        (0.2 + 0.6 * h, 0.2 + 0.6 * hash01(cyc.wrapping_mul(0x4C95_7F2D)))
+    }
+}
+
+fn supernova_at(x: f32, y: f32, ts: f32, ign: (f32, f32)) -> Color {
+    let ph = (ts / SUPERNOVA_PERIOD).rem_euclid(1.0);
+    let d = ((x - ign.0).powi(2) + (y - ign.1).powi(2)).sqrt();
+    const CHARGE: f32 = 0.58;
+    const IGNITE: f32 = 0.63;
+    if ph < CHARGE {
+        // Gathering: concentric waves run INWARD to the ignition point,
+        // accelerating and brightening as the core loads up.
+        let k = ph / CHARGE;
+        let w = 0.5 + 0.5 * (d * 13.0 + ts * TAU * (0.6 + 1.6 * k)).sin();
+        let core = (-(d / 0.22).powi(2)).exp() * k * k * k;
+        // Floor keeps the slow early charge visible on a 12-LED ring.
+        let val = (0.14 + 0.42 * k * k) * w + 0.75 * core;
+        Color::from_hsv(262.0 - 40.0 * k, 0.9 - 0.3 * core, val.clamp(0.0, 1.0))
+    } else if ph < IGNITE {
+        // Collapse: the core implodes to a pinpoint, everything else goes dark.
+        let k = (ph - CHARGE) / (IGNITE - CHARGE);
+        let core = (-(d / (0.22 * (1.0 - k) + 0.02)).powi(2)).exp();
+        Color::from_hsv(220.0, 0.4, core * (1.0 - 0.5 * k))
+    } else {
+        let e = (ph - IGNITE) / (1.0 - IGNITE);
+        let r = 1.35 * (1.0 - (1.0 - e).powi(3)); // fast blast, slow coast
+        let behind = r - d;
+        let mut c = if behind > 0.0 {
+            // Material behind the front cools with age since the front passed.
+            let age = behind / 1.35 + e * 0.6;
+            heat_color(1.0 - age * 1.25)
+        } else {
+            Color::BLACK
+        };
+        let front = (-((d - r) / 0.07).powi(2)).exp() * (1.0 - e).sqrt();
+        c = add_sat(c, Color { r: 255, g: 245, b: 225 }.scale(front));
+        let flash = (1.0 - e / 0.06).max(0.0);
+        add_sat(c, Color { r: 255, g: 255, b: 255 }.scale(flash * 0.7))
+    }
+}
+
+fn lava_at(x: f32, y: f32, ts: f32, color: Color) -> Color {
+    let mut field = 0.0_f32;
+    for k in 0..4u64 {
+        let hk = hash01(k.wrapping_mul(0x632B_E5AB) + 11);
+        let rate = 0.07 + 0.05 * hk;
+        let phase = (ts * rate + hash01(k * 31 + 7)).rem_euclid(1.0);
+        let by = 1.3 - phase * 1.6; // bottom -> top, entering/leaving off-zone
+        let bx = 0.5 + 0.28 * (ts * (0.21 + 0.07 * k as f32) + k as f32 * 2.1).sin();
+        // Slightly tall blobs. Gaussian falloff so blobs stay separate: an
+        // inverse-square field leaks and washes the whole ring in wax.
+        let r = 0.16 + 0.05 * hk;
+        let (dx, dy) = ((x - bx) / r, (y - by) / (r * 1.3));
+        field += (-(dx * dx + dy * dy)).exp();
+    }
+    let (h, s, _) = to_hsv(color);
+    let fluid = Color::from_hsv(h - 50.0, 0.95, 0.03 + 0.05 * y);
+    let m = smoothstep(0.30, 0.70, field);
+    let core = smoothstep(0.75, 1.3, field);
+    let wax = lerp_color(color.scale(0.75), Color::from_hsv(h + 18.0, s * 0.55, 1.0), core * 0.7);
+    lerp_color(fluid, wax, m)
+}
+
+const REACTOR_PERIOD: f32 = 3.4;
+
+/// `h` = height in the zone, 0 = bottom .. 1 = top.
+fn reactor_at(h: f32, ts: f32, color: Color) -> Color {
+    let ph = (ts / REACTOR_PERIOD).rem_euclid(1.0);
+    const FILL: f32 = 0.62;
+    const OVERLOAD: f32 = 0.74;
+    let hum = 0.82 + 0.18 * (ts * 11.0 - h * 18.0).sin();
+    if ph < FILL {
+        let lvl = smoothstep(0.0, 1.0, ph / FILL) * 1.08;
+        let inside = smoothstep(lvl + 0.04, lvl - 0.04, h);
+        let edge = (-((h - lvl) / 0.07).powi(2)).exp();
+        let c = color.scale(inside * hum * (0.35 + 0.45 * lvl));
+        add_sat(c, lerp_color(color, Color { r: 255, g: 255, b: 255 }, 0.6).scale(edge))
+    } else if ph < OVERLOAD {
+        // Overload: stutter-flash white over the full core.
+        let k = (ph - FILL) / (OVERLOAD - FILL);
+        let strobe = 0.6 + 0.4 * (k * 40.0).sin().abs();
+        lerp_color(color, Color { r: 255, g: 255, b: 255 }, (1.0 - k) * strobe)
+    } else {
+        // Vent: the charge drains out the top with a dimming afterglow.
+        let k = (ph - OVERLOAD) / (1.0 - OVERLOAD);
+        let lvl = 1.0 - smoothstep(0.0, 1.0, k);
+        let inside = smoothstep(lvl + 0.08, lvl - 0.08, h);
+        color.scale(inside * (1.0 - 0.7 * k) * hum)
+    }
+}
+
+fn reactor_lamp(ts: f32, color: Color) -> Color {
+    // The lamp sees the fill edge sweep through mid-height.
+    reactor_at(0.5, ts, color)
 }
 
 /// Deterministic lightning state at storm-time `ts`: (flash level 0..1, bolt
@@ -784,6 +931,21 @@ fn spatial_positions(zone: &ZoneInfo) -> Vec<(f32, f32)> {
         led_positions(zone)
             .into_iter()
             .map(|p| (p, 0.5 - 0.5 * (p * TAU).cos()))
+            .collect()
+    }
+}
+
+/// Physical 2D position per LED (0..1, y = 0 top). Key matrices use key
+/// centers; strips are treated as a fan ring of diameter 1 (LED 0 at top,
+/// same orientation as `spatial_positions`), so distance-based effects
+/// (blobs, shock fronts) measure real distance around the ring.
+fn planar_positions(zone: &ZoneInfo) -> Vec<(f32, f32)> {
+    if zone.keys.is_some() {
+        key_positions(zone)
+    } else {
+        led_positions(zone)
+            .into_iter()
+            .map(|p| (0.5 - 0.5 * (p * TAU).sin(), 0.5 - 0.5 * (p * TAU).cos()))
             .collect()
     }
 }

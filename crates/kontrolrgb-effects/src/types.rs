@@ -226,6 +226,24 @@ pub enum EffectConfig {
     Glacier {
         speed: f32,
     },
+    /// Energy gathers inward to a point, collapses, then detonates into a
+    /// white shock front that races outward and cools through gold to embers.
+    /// Fan rings ignite at a random point on the ring each cycle.
+    Supernova {
+        speed: f32,
+    },
+    /// Slow wax blobs in `color` rise, stretch and merge through a dark fluid
+    /// tinted toward the color's warmer neighbor.
+    LavaLamp {
+        color: Color,
+        speed: f32,
+    },
+    /// A core charges bottom-up in `color` with a bright fill line, overloads
+    /// in a white strobe, then vents out the top. Fan rings fill both sides.
+    Reactor {
+        color: Color,
+        speed: f32,
+    },
     /// Firmware-animated effect (hardware runs it; host sets it once).
     Onboard(OnboardEffect),
 }
@@ -236,7 +254,7 @@ fn default_vortex_arms() -> u32 {
 
 impl EffectConfig {
     /// Host-computed effect kinds (used by the mock devices' supported_effects).
-    pub const ALL_KINDS: [&'static str; 23] = [
+    pub const ALL_KINDS: [&'static str; 26] = [
         "static",
         "breathing",
         "rainbow_wave",
@@ -260,6 +278,9 @@ impl EffectConfig {
         "cascade",
         "neon_noir",
         "glacier",
+        "supernova",
+        "lava_lamp",
+        "reactor",
     ];
 }
 

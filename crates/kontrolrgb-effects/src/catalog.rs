@@ -60,6 +60,17 @@ pub fn effect_catalog() -> Value {
         ]},
         {"kind": "neon_noir", "name": "Neon Noir", "params": [speed(), reverse()]},
         {"kind": "glacier", "name": "Glacier", "params": [speed()]},
+        {"kind": "supernova", "name": "Supernova", "params": [speed()]},
+        {"kind": "lava_lamp", "name": "Lava Lamp", "params": [
+            {"id": "color", "label": "Color", "type": "color",
+             "default": {"r": 255, "g": 80, "b": 10}},
+            speed(),
+        ]},
+        {"kind": "reactor", "name": "Reactor", "params": [
+            {"id": "color", "label": "Color", "type": "color",
+             "default": {"r": 40, "g": 170, "b": 255}},
+            speed(),
+        ]},
         // Host preview of the GMMK firmware modes. Serde flattens OnboardEffect
         // fields next to the tag, so param ids are the OnboardEffect fields.
         {"kind": "onboard", "name": "Onboard (GMMK firmware)", "params": [

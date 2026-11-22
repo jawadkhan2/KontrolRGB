@@ -653,6 +653,12 @@ body {
 .pv-cascade { background: repeating-linear-gradient(180deg, #fff 0 1%, var(--seg) 1.8% 5%, transparent 15% 25%), #070a10; background-size: 100% 200%; animation: cascadefall 1.5s linear infinite; }
 .pv-neonnoir { background: linear-gradient(90deg, transparent 44%, rgba(255, 255, 255, 0.92) 50%, transparent 56%), linear-gradient(90deg, #22d3ee, #7c3aed, #ff2fd0, #7c3aed, #22d3ee); background-size: 240% 100%, 100% 100%; animation: stripe 2.4s linear infinite; }
 .pv-glacier { background: linear-gradient(160deg, #072a4a, #38bdf8, #bae6fd, #0e7490); background-size: 220% 220%; animation: stripe 5s ease-in-out infinite, glacierbloom 4.2s ease-out infinite; }
+.pv-supernova { background: radial-gradient(circle, #fff 0 5%, #fde68a 12%, #f97316 24%, #991b1b 38%, transparent 56%) center / 0% 0% no-repeat, radial-gradient(circle, #6d28d9, #1e1b4b 70%); animation: supernova 4.8s ease-out infinite; }
+.pv-lava { background: radial-gradient(ellipse 22% 8% at 30% 20%, var(--seg) 0 55%, transparent 100%), radial-gradient(ellipse 22% 8% at 30% 70%, var(--seg) 0 55%, transparent 100%), radial-gradient(ellipse 16% 6% at 70% 40%, var(--seg) 0 55%, transparent 100%), radial-gradient(ellipse 16% 6% at 70% 90%, var(--seg) 0 55%, transparent 100%), #2a0718; background-size: 100% 200%; animation: lavarise 7s linear infinite; }
+.pv-reactor { background: linear-gradient(0deg, var(--seg) 0 47%, #e0f2fe 47% 53%, #06101c 53%); background-size: 100% 220%; animation: reactorfill 3.4s ease-in infinite; }
+@keyframes supernova { 0%, 60% { background-size: 0% 0%, 100% 100%; filter: brightness(0.8); } 63% { background-size: 40% 40%, 100% 100%; filter: brightness(1.6); } 100% { background-size: 320% 320%, 100% 100%; filter: brightness(0.6); } }
+@keyframes lavarise { from { background-position: 0 0%; } to { background-position: 0 100%; } }
+@keyframes reactorfill { 0% { background-position: 0 0%; filter: brightness(1); } 62% { background-position: 0 100%; filter: brightness(1); } 67% { filter: brightness(2.2); } 74% { background-position: 0 100%; filter: brightness(1); } 100% { background-position: 0 0%; filter: brightness(0.6); } }
 @keyframes tideswell { from { background-position: 0 28%; } to { background-position: 0 66%; } }
 @keyframes cascadefall { to { background-position: 0 100%; } }
 @keyframes glacierbloom { 0%, 70%, 100% { filter: brightness(1); } 12% { filter: brightness(1.5) saturate(0.85); } 30% { filter: brightness(1.12); } }
@@ -727,6 +733,9 @@ body {
 .preview .bar.pv-cascade { background: repeating-linear-gradient(180deg, #fff 0 1%, var(--pick, #5b8cff) 1.8% 5%, transparent 15% 25%), #070a10; background-size: 100% 200%; animation: cascadefall 1.5s linear infinite; }
 .preview .bar.pv-neonnoir { background: linear-gradient(90deg, transparent 46%, rgba(255, 255, 255, 0.92) 50%, transparent 54%), linear-gradient(90deg, #22d3ee, #7c3aed, #ff2fd0, #7c3aed, #22d3ee); background-size: 240% 100%, 100% 100%; animation: stripe 2.4s linear infinite; }
 .preview .bar.pv-glacier { background: linear-gradient(160deg, #072a4a, #38bdf8, #bae6fd, #0e7490); background-size: 220% 220%; animation: stripe 5s ease-in-out infinite, glacierbloom 4.2s ease-out infinite; }
+.preview .bar.pv-supernova { background: radial-gradient(circle, #fff 0 5%, #fde68a 12%, #f97316 24%, #991b1b 38%, transparent 56%) center / 0% 0% no-repeat, radial-gradient(circle, #6d28d9, #1e1b4b 70%); animation: supernova 4.8s ease-out infinite; }
+.preview .bar.pv-lava { background: radial-gradient(ellipse 22% 8% at 30% 20%, var(--pick, #ff500a) 0 55%, transparent 100%), radial-gradient(ellipse 22% 8% at 30% 70%, var(--pick, #ff500a) 0 55%, transparent 100%), radial-gradient(ellipse 16% 6% at 70% 40%, var(--pick, #ff500a) 0 55%, transparent 100%), radial-gradient(ellipse 16% 6% at 70% 90%, var(--pick, #ff500a) 0 55%, transparent 100%), #2a0718; background-size: 100% 200%; animation: lavarise 7s linear infinite; }
+.preview .bar.pv-reactor { background: linear-gradient(0deg, var(--pick, #28aaff) 0 47%, #e0f2fe 47% 53%, #06101c 53%); background-size: 100% 220%; animation: reactorfill 3.4s ease-in infinite; }
 
 /* device tiles : click to include / exclude */
 .dev-tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
